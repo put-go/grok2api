@@ -507,17 +507,27 @@ func videoSegments(seconds int) []int {
 
 func videoCreatePayload(prompt, parentID, ratio, resolution string, seconds int, referenceAssetIDs []string) map[string]any {
 	if len(referenceAssetIDs) > 0 {
+		mode := "custom"
+		inputKind := "referenceToVideo"
+		input := map[string]any{
+			"prompt": prompt, "inputAssets": referenceAssetIDs, "aspectRatio": ratio,
+			"duration": seconds, "resolutionName": resolution,
+		}
+		if len(referenceAssetIDs) == 1 {
+			inputKind = "imageToVideo"
+			if strings.TrimSpace(prompt) == "" {
+				mode = "normal"
+			}
+			input["mode"] = mode
+		}
 		return map[string]any{
-			"modelName": "imagine-video-gen", "message": prompt + " --mode=custom",
+			"modelName": "imagine-video-gen", "message": videoModeMessage(prompt, mode),
 			"enableImageStreaming": true, "enableSideBySide": true, "sendFinalMetadata": true,
 			"responseMetadata": map[string]any{
 				"experiments": []any{}, "modelConfigOverride": map[string]any{"modelMap": map[string]any{}},
 			},
-			"mediaGenInput": map[string]any{"imageToVideo": map[string]any{
-				"prompt": prompt, "inputAssets": referenceAssetIDs, "aspectRatio": ratio,
-				"duration": seconds, "resolutionName": resolution, "mode": "custom",
-			}},
-			"kind": "CONVERSATION_KIND_IMAGINE",
+			"mediaGenInput": map[string]any{inputKind: input},
+			"kind":          "CONVERSATION_KIND_IMAGINE",
 		}
 	}
 	config := map[string]any{"parentPostId": parentID, "aspectRatio": ratio, "videoLength": seconds, "resolutionName": resolution}
@@ -525,4 +535,12 @@ func videoCreatePayload(prompt, parentID, ratio, resolution string, seconds int,
 		"temporary": true, "modelName": "imagine-video-gen", "message": prompt + " --mode=custom", "enableSideBySide": true,
 		"responseMetadata": map[string]any{"experiments": []any{}, "modelConfigOverride": map[string]any{"modelMap": map[string]any{"videoGenModelConfig": config}}},
 	}
+}
+
+func videoModeMessage(prompt, mode string) string {
+	prompt = strings.TrimSpace(prompt)
+	if prompt == "" {
+		return "--mode=" + mode
+	}
+	return prompt + " --mode=" + mode
 }

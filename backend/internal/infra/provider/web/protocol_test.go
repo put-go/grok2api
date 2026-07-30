@@ -617,35 +617,85 @@ func TestBuildImageEditPayloadMatchesCapturedAspectRatioShape(t *testing.T) {
 	}
 }
 
-func TestBuildVideoPayloadMatchesCapturedImageToVideoShape(t *testing.T) {
-	payload := videoCreatePayload("打招呼", "", "2:3", "720p", 10, []string{"asset-1"})
-	if payload["modelName"] != "imagine-video-gen" || payload["message"] != "打招呼 --mode=custom" || payload["kind"] != "CONVERSATION_KIND_IMAGINE" {
-		t.Fatalf("payload = %#v", payload)
-	}
-	for _, field := range []string{"enableImageStreaming", "enableSideBySide", "sendFinalMetadata"} {
-		if payload[field] != true {
-			t.Fatalf("%s = %#v", field, payload[field])
+func TestBuildVideoPayloadMatchesCapturedReferenceShapes(t *testing.T) {
+	assertReferenceEnvelope := func(t *testing.T, payload map[string]any, message string) map[string]any {
+		t.Helper()
+		if payload["modelName"] != "imagine-video-gen" || payload["message"] != message || payload["kind"] != "CONVERSATION_KIND_IMAGINE" {
+			t.Fatalf("payload = %#v", payload)
 		}
-	}
-	mediaGenInput, _ := payload["mediaGenInput"].(map[string]any)
-	imageToVideo, _ := mediaGenInput["imageToVideo"].(map[string]any)
-	if imageToVideo["prompt"] != "打招呼" || imageToVideo["aspectRatio"] != "2:3" || imageToVideo["duration"] != 10 || imageToVideo["resolutionName"] != "720p" || imageToVideo["mode"] != "custom" {
-		t.Fatalf("imageToVideo = %#v", imageToVideo)
-	}
-	if !slices.Equal(imageToVideo["inputAssets"].([]string), []string{"asset-1"}) {
-		t.Fatalf("inputAssets = %#v", imageToVideo["inputAssets"])
-	}
-	metadata, _ := payload["responseMetadata"].(map[string]any)
-	override, _ := metadata["modelConfigOverride"].(map[string]any)
-	modelMap, _ := override["modelMap"].(map[string]any)
-	if len(modelMap) != 0 {
-		t.Fatalf("modelMap = %#v", modelMap)
-	}
-	for _, obsolete := range []string{"temporary", "videoGenModelConfig"} {
-		if _, exists := payload[obsolete]; exists {
-			t.Fatalf("obsolete field %q leaked into payload", obsolete)
+		for _, field := range []string{"enableImageStreaming", "enableSideBySide", "sendFinalMetadata"} {
+			if payload[field] != true {
+				t.Fatalf("%s = %#v", field, payload[field])
+			}
 		}
+		metadata, _ := payload["responseMetadata"].(map[string]any)
+		override, _ := metadata["modelConfigOverride"].(map[string]any)
+		modelMap, _ := override["modelMap"].(map[string]any)
+		if len(modelMap) != 0 {
+			t.Fatalf("modelMap = %#v", modelMap)
+		}
+		if _, exists := payload["temporary"]; exists {
+			t.Fatalf("obsolete temporary field leaked into payload: %#v", payload)
+		}
+		mediaGenInput, _ := payload["mediaGenInput"].(map[string]any)
+		return mediaGenInput
 	}
+
+	t.Run("single image custom", func(t *testing.T) {
+		payload := videoCreatePayload("打招呼", "", "2:3", "720p", 10, []string{"asset-1"})
+		mediaGenInput := assertReferenceEnvelope(t, payload, "打招呼 --mode=custom")
+		imageToVideo, _ := mediaGenInput["imageToVideo"].(map[string]any)
+		if imageToVideo["prompt"] != "打招呼" || imageToVideo["aspectRatio"] != "2:3" || imageToVideo["duration"] != 10 || imageToVideo["resolutionName"] != "720p" || imageToVideo["mode"] != "custom" {
+			t.Fatalf("imageToVideo = %#v", imageToVideo)
+		}
+		if !slices.Equal(imageToVideo["inputAssets"].([]string), []string{"asset-1"}) {
+			t.Fatalf("inputAssets = %#v", imageToVideo["inputAssets"])
+		}
+		if _, exists := mediaGenInput["referenceToVideo"]; exists {
+			t.Fatalf("single image used referenceToVideo: %#v", mediaGenInput)
+		}
+	})
+
+	t.Run("single image normal", func(t *testing.T) {
+		payload := videoCreatePayload("", "", "2:3", "720p", 6, []string{"asset-1"})
+		mediaGenInput := assertReferenceEnvelope(t, payload, "--mode=normal")
+		imageToVideo, _ := mediaGenInput["imageToVideo"].(map[string]any)
+		if imageToVideo["prompt"] != "" || imageToVideo["mode"] != "normal" {
+			t.Fatalf("imageToVideo = %#v", imageToVideo)
+		}
+	})
+
+	t.Run("multiple references", func(t *testing.T) {
+		payload := videoCreatePayload("打招呼", "", "2:3", "720p", 6, []string{"asset-1", "asset-2"})
+		mediaGenInput := assertReferenceEnvelope(t, payload, "打招呼 --mode=custom")
+		referenceToVideo, _ := mediaGenInput["referenceToVideo"].(map[string]any)
+		if referenceToVideo["prompt"] != "打招呼" || referenceToVideo["aspectRatio"] != "2:3" || referenceToVideo["duration"] != 6 || referenceToVideo["resolutionName"] != "720p" {
+			t.Fatalf("referenceToVideo = %#v", referenceToVideo)
+		}
+		if !slices.Equal(referenceToVideo["inputAssets"].([]string), []string{"asset-1", "asset-2"}) {
+			t.Fatalf("inputAssets = %#v", referenceToVideo["inputAssets"])
+		}
+		if _, exists := referenceToVideo["mode"]; exists {
+			t.Fatalf("referenceToVideo leaked mode: %#v", referenceToVideo)
+		}
+		if _, exists := mediaGenInput["imageToVideo"]; exists {
+			t.Fatalf("multiple references used imageToVideo: %#v", mediaGenInput)
+		}
+	})
+
+	t.Run("text to video keeps legacy payload", func(t *testing.T) {
+		payload := videoCreatePayload("打招呼", "post-1", "2:3", "720p", 6, nil)
+		metadata := payload["responseMetadata"].(map[string]any)
+		override := metadata["modelConfigOverride"].(map[string]any)
+		modelMap := override["modelMap"].(map[string]any)
+		config := modelMap["videoGenModelConfig"].(map[string]any)
+		if payload["temporary"] != true || config["parentPostId"] != "post-1" || config["videoLength"] != 6 {
+			t.Fatalf("legacy payload = %#v", payload)
+		}
+		if _, exists := payload["mediaGenInput"]; exists {
+			t.Fatalf("legacy payload leaked mediaGenInput: %#v", payload)
+		}
+	})
 }
 
 func TestImageEditAspectRatioSupportsOpenAISize(t *testing.T) {
@@ -836,8 +886,9 @@ func TestBuildDirectFileUploadBodyOmitsSourceForChat(t *testing.T) {
 	}
 }
 
-func TestVideoReferenceUsesV2DirectUploadAndCapturedPayload(t *testing.T) {
+func TestVideoReferencesUseV2DirectUploadAndCapturedPayload(t *testing.T) {
 	dataURI := "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+	var uploadCalls atomic.Int64
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		switch request.URL.Path {
 		case "/http/upload-file-v2/direct":
@@ -860,8 +911,9 @@ func TestVideoReferenceUsesV2DirectUploadAndCapturedPayload(t *testing.T) {
 			if request.FormValue("file_source") != imagineSelfUploadSource {
 				t.Errorf("file_source = %q", request.FormValue("file_source"))
 			}
+			uploadIndex := uploadCalls.Add(1)
 			writer.Header().Set("Content-Type", "application/json")
-			_, _ = io.WriteString(writer, `{"uploadId":"upload-1","fileMetadata":{"fileMetadataId":"metadata-1","fileUri":"users/test/reference/content"}}`)
+			_, _ = fmt.Fprintf(writer, `{"uploadId":"upload-%d","fileMetadata":{"fileMetadataId":"metadata-%d","fileUri":"users/test/reference-%d/content"}}`, uploadIndex, uploadIndex, uploadIndex)
 		case "/rest/app-chat/conversations/new":
 			var payload map[string]any
 			if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
@@ -870,10 +922,13 @@ func TestVideoReferenceUsesV2DirectUploadAndCapturedPayload(t *testing.T) {
 				return
 			}
 			mediaGenInput, _ := payload["mediaGenInput"].(map[string]any)
-			imageToVideo, _ := mediaGenInput["imageToVideo"].(map[string]any)
-			inputAssets, _ := imageToVideo["inputAssets"].([]any)
-			if len(inputAssets) != 1 || inputAssets[0] != "metadata-1" {
-				t.Errorf("inputAssets = %#v", imageToVideo["inputAssets"])
+			referenceToVideo, _ := mediaGenInput["referenceToVideo"].(map[string]any)
+			inputAssets, _ := referenceToVideo["inputAssets"].([]any)
+			if !slices.Equal(inputAssets, []any{"metadata-1", "metadata-2"}) {
+				t.Errorf("inputAssets = %#v", referenceToVideo["inputAssets"])
+			}
+			if _, exists := referenceToVideo["mode"]; exists {
+				t.Errorf("referenceToVideo leaked mode: %#v", referenceToVideo)
 			}
 			writer.Header().Set("Content-Type", "text/event-stream")
 			_, _ = io.WriteString(writer, `data: {"result":{"response":{"streamingVideoGenerationResponse":{"progress":100,"videoPostId":"post-1","videoUrl":"users/test/generated/video.mp4"}}}}`+"\n")
@@ -899,13 +954,16 @@ func TestVideoReferenceUsesV2DirectUploadAndCapturedPayload(t *testing.T) {
 		Duration:      10,
 		AspectRatio:   "2:3",
 		Resolution:    "720p",
-		ReferenceURLs: []string{dataURI},
+		ReferenceURLs: []string{dataURI, dataURI},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if result.URL != "https://assets.grok.com/users/test/generated/video.mp4" {
 		t.Fatalf("video URL = %q", result.URL)
+	}
+	if uploadCalls.Load() != 2 {
+		t.Fatalf("upload calls = %d", uploadCalls.Load())
 	}
 }
 
