@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"math"
 	"net/http"
@@ -52,6 +53,44 @@ func TestVideoGenerationUsesOfficialXAIEndpointsAndFields(t *testing.T) {
 	router.ServeHTTP(invalidRecorder, invalidDuration)
 	if invalidRecorder.Code != http.StatusBadRequest || !strings.Contains(invalidRecorder.Body.String(), "1 到 15") {
 		t.Fatalf("invalid duration status=%d body=%s", invalidRecorder.Code, invalidRecorder.Body.String())
+	}
+
+	multiReferenceTooLong := httptest.NewRequest(http.MethodPost, "/v1/videos/generations", strings.NewReader(`{
+		"model":"grok-imagine-video","prompt":"test","duration":11,
+		"reference_images":[{"url":"https://example.com/1.png"},{"url":"https://example.com/2.png"}]
+	}`))
+	multiReferenceTooLong.Header.Set("Content-Type", "application/json")
+	multiReferenceRecorder := httptest.NewRecorder()
+	router.ServeHTTP(multiReferenceRecorder, multiReferenceTooLong)
+	if multiReferenceRecorder.Code != http.StatusBadRequest || !strings.Contains(multiReferenceRecorder.Body.String(), "不能超过 10 秒") {
+		t.Fatalf("multi-reference duration status=%d body=%s", multiReferenceRecorder.Code, multiReferenceRecorder.Body.String())
+	}
+
+	eightReferences := make([]videoGenerationImage, 8)
+	for index := range eightReferences {
+		eightReferences[index].URL = fmt.Sprintf("https://example.com/%d.png", index)
+	}
+	eightReferenceBody, err := json.Marshal(videoGenerationRequest{Model: "grok-imagine-video", Prompt: "test", ReferenceImages: eightReferences})
+	if err != nil {
+		t.Fatal(err)
+	}
+	eightReferenceRequest := httptest.NewRequest(http.MethodPost, "/v1/videos/generations", bytes.NewReader(eightReferenceBody))
+	eightReferenceRequest.Header.Set("Content-Type", "application/json")
+	eightReferenceRecorder := httptest.NewRecorder()
+	router.ServeHTTP(eightReferenceRecorder, eightReferenceRequest)
+	if eightReferenceRecorder.Code != http.StatusBadRequest || !strings.Contains(eightReferenceRecorder.Body.String(), "不能超过 7 张") {
+		t.Fatalf("reference count status=%d body=%s", eightReferenceRecorder.Code, eightReferenceRecorder.Body.String())
+	}
+
+	singleReferenceFifteenSeconds := httptest.NewRequest(http.MethodPost, "/v1/videos/generations", strings.NewReader(`{
+		"model":"grok-imagine-video","prompt":"test","duration":15,
+		"reference_images":[{"url":"https://example.com/1.png"}]
+	}`))
+	singleReferenceFifteenSeconds.Header.Set("Content-Type", "application/json")
+	singleReferenceRecorder := httptest.NewRecorder()
+	router.ServeHTTP(singleReferenceRecorder, singleReferenceFifteenSeconds)
+	if singleReferenceRecorder.Code != http.StatusUnauthorized {
+		t.Fatalf("single-reference duration status=%d body=%s", singleReferenceRecorder.Code, singleReferenceRecorder.Body.String())
 	}
 
 	valid := httptest.NewRequest(http.MethodPost, "/v1/videos/generations", strings.NewReader(`{

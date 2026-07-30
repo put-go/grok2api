@@ -655,8 +655,12 @@ func (h *Handler) generateVideo(c *gin.Context) {
 	if request.Image != nil {
 		inputs = append([]videoGenerationImage{*request.Image}, inputs...)
 	}
-	if len(inputs) > mediadomain.MaxInputImages {
-		writeOpenAIError(c, http.StatusBadRequest, "invalid_request", fmt.Sprintf("image 与 reference_images 合计不能超过 %d 张", mediadomain.MaxInputImages))
+	if len(inputs) > mediadomain.MaxReferenceImages {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request", fmt.Sprintf("image 与 reference_images 合计不能超过 %d 张", mediadomain.MaxReferenceImages))
+		return
+	}
+	if len(inputs) > 1 && duration > mediadomain.MaxReferenceVideoDuration {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request", fmt.Sprintf("多参考图视频的 duration 不能超过 %d 秒", mediadomain.MaxReferenceVideoDuration))
 		return
 	}
 	referenceURLs := make([]string, 0, len(inputs))
@@ -764,8 +768,8 @@ func parseVideoDuration(durationRaw json.RawMessage) (int, error) {
 	if hasDuration {
 		value = duration
 	}
-	if value < 1 || value > 15 {
-		return 0, fmt.Errorf("duration 必须在 1 到 15 秒之间")
+	if value < 1 || value > mediadomain.MaxVideoDuration {
+		return 0, fmt.Errorf("duration 必须在 1 到 %d 秒之间", mediadomain.MaxVideoDuration)
 	}
 	return value, nil
 }

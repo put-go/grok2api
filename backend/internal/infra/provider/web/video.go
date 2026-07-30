@@ -16,6 +16,7 @@ import (
 
 	"github.com/chenyme/grok2api/backend/internal/domain/account"
 	domainegress "github.com/chenyme/grok2api/backend/internal/domain/egress"
+	mediadomain "github.com/chenyme/grok2api/backend/internal/domain/media"
 	"github.com/chenyme/grok2api/backend/internal/infra/egress"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
 )
@@ -208,6 +209,12 @@ func boundWebMediaDiagnostic(value string, limit int) string {
 }
 
 func (a *Adapter) GenerateVideo(ctx context.Context, request provider.VideoRequest) (provider.VideoResult, error) {
+	if len(request.ReferenceURLs) > mediadomain.MaxReferenceImages {
+		return provider.VideoResult{}, fmt.Errorf("视频参考图片不能超过 %d 张", mediadomain.MaxReferenceImages)
+	}
+	if len(request.ReferenceURLs) > 1 && request.Duration > mediadomain.MaxReferenceVideoDuration {
+		return provider.VideoResult{}, fmt.Errorf("多参考图视频的 duration 不能超过 %d 秒", mediadomain.MaxReferenceVideoDuration)
+	}
 	cfg := a.config()
 	token, err := a.cipher.Decrypt(request.Credential.EncryptedAccessToken)
 	if err != nil {
@@ -404,8 +411,14 @@ func parseVideoStream(response *http.Response, progress func(int)) (provider.Vid
 }
 
 func webMediaStreamError(value map[string]any) error {
+	code := safeWebMediaDiagnostic(firstWebMediaDiagnosticCode(value, "code", "error_code", "type"), 64)
 	message := safeWebMediaDiagnostic(firstString(value, "message", "error", "detail"), webMediaDiagnosticFieldLimit)
-	if message == "" {
+	switch {
+	case code != "" && message != "":
+		message = code + ": " + message
+	case code != "":
+		message = code
+	case message == "":
 		message = "未提供错误详情"
 	}
 	return fmt.Errorf("视频上游错误: %s", message)
@@ -499,7 +512,7 @@ func nestedMap(value map[string]any, keys ...string) map[string]any {
 }
 
 func videoSegments(seconds int) []int {
-	if seconds < 1 || seconds > 15 {
+	if seconds < 1 || seconds > mediadomain.MaxVideoDuration {
 		return nil
 	}
 	return []int{seconds}

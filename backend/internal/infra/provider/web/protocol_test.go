@@ -991,6 +991,27 @@ func TestWebMediaStreamErrorRedactsSensitiveValues(t *testing.T) {
 	}
 }
 
+func TestWebMediaStreamErrorIncludesNumericCodeWithoutMessage(t *testing.T) {
+	err := webMediaStreamError(map[string]any{"code": float64(1300)})
+	if !strings.Contains(err.Error(), "1300") || strings.Contains(err.Error(), "未提供错误详情") {
+		t.Fatalf("stream error = %v", err)
+	}
+}
+
+func TestGenerateVideoRejectsUnsupportedReferenceLimitsBeforeUpstream(t *testing.T) {
+	adapter := &Adapter{}
+	if _, err := adapter.GenerateVideo(context.Background(), provider.VideoRequest{
+		Duration: 11, ReferenceURLs: []string{"one", "two"},
+	}); err == nil || !strings.Contains(err.Error(), "不能超过 10 秒") {
+		t.Fatalf("multi-reference duration error = %v", err)
+	}
+	if _, err := adapter.GenerateVideo(context.Background(), provider.VideoRequest{
+		Duration: 10, ReferenceURLs: make([]string, mediadomain.MaxReferenceImages+1),
+	}); err == nil || !strings.Contains(err.Error(), "不能超过 7 张") {
+		t.Fatalf("reference count error = %v", err)
+	}
+}
+
 func TestWebMediaUpstreamDiagnosticLogsStageHeadersWithoutBodyPreview(t *testing.T) {
 	var output bytes.Buffer
 	adapter := &Adapter{logger: slog.New(slog.NewTextHandler(&output, nil))}
