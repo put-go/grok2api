@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -25,7 +24,6 @@ import (
 type webMediaUpstreamError struct {
 	status              int
 	summary             string
-	antiBot             bool
 	bodyBytes           int
 	bodyTruncated       bool
 	bodyPrefixSHA256    string
@@ -101,31 +99,15 @@ var (
 // body metadata and a prefix hash, never the upstream response body itself.
 func newWebMediaUpstreamError(status int, body []byte, truncated bool) *webMediaUpstreamError {
 	digest := sha256.Sum256(body)
-	cloudflareChallenge := isCloudflareChallengeBody(body)
 	return &webMediaUpstreamError{
 		status:              status,
 		summary:             summarizeWebMediaUpstreamError(status, body, truncated),
-		antiBot:             isWebMediaAntiBotBody(status, body) || (status == http.StatusForbidden && cloudflareChallenge),
 		bodyBytes:           len(body),
 		bodyTruncated:       truncated,
 		bodyPrefixSHA256:    fmt.Sprintf("%x", digest),
 		bodyKind:            classifyWebMediaDiagnosticBody(body),
-		cloudflareChallenge: cloudflareChallenge,
+		cloudflareChallenge: isCloudflareChallengeBody(body),
 	}
-}
-
-func isWebMediaAntiBotBody(status int, body []byte) bool {
-	if status != http.StatusForbidden {
-		return false
-	}
-	code, message, _ := extractWebMediaUpstreamErrorFields(body)
-	message = strings.ToLower(message)
-	return code == "7" || strings.Contains(message, "anti-bot") || strings.Contains(message, "anti bot")
-}
-
-func isWebMediaAntiBotError(err error) bool {
-	var upstreamErr *webMediaUpstreamError
-	return errors.As(err, &upstreamErr) && upstreamErr.antiBot
 }
 
 func classifyWebMediaDiagnosticBody(body []byte) string {
@@ -275,53 +257,20 @@ func (a *Adapter) GenerateVideo(ctx context.Context, request provider.VideoReque
 	if err != nil {
 		return provider.VideoResult{}, err
 	}
-	defer func() { lease.Release() }()
+	defer lease.Release()
 	parentID := ""
 	referenceAssetIDs := make([]string, 0, len(request.ReferenceURLs))
 	for _, rawReference := range request.ReferenceURLs {
-		rawReference = strings.TrimSpace(rawReference)
-		if rawReference == "" {
-			return provider.VideoResult{}, fmt.Errorf("视频参考图片 URL 不能为空")
-		}
-		image, referenceErr := a.loadChatImage(ctx, lease, rawReference, 20<<20)
+		assetID, referenceErr := a.prepareVideoReference(ctx, cfg, lease, token, rawReference)
 		if referenceErr != nil {
 			return provider.VideoResult{}, referenceErr
-		}
-		var assetID string
-		for attempt := 0; attempt < 2; attempt++ {
-			uploaded, uploadErr := a.uploadFileV2Direct(ctx, cfg, lease, token, image, cfg.BaseURL+"/imagine", imagineSelfUploadSource, "video_reference_upload")
-			if uploadErr == nil {
-				assetID = uploaded.ID
-				break
-			}
-			if attempt > 0 || !isWebMediaAntiBotError(uploadErr) {
-				return provider.VideoResult{}, uploadErr
-			}
-			a.logVideoAntiBotRetry(request, "video_reference_upload")
-			lease, err = a.refreshVideoLease(ctx, lease, request.Credential)
-			if err != nil {
-				return provider.VideoResult{}, err
-			}
-		}
-		if assetID == "" {
-			return provider.VideoResult{}, fmt.Errorf("上传视频参考图片后未返回 fileMetadataId")
 		}
 		referenceAssetIDs = append(referenceAssetIDs, assetID)
 	}
 	if len(referenceAssetIDs) == 0 {
-		for attempt := 0; attempt < 2; attempt++ {
-			parentID, err = a.createMediaPost(ctx, cfg, lease, token, "MEDIA_POST_TYPE_VIDEO", "", request.Prompt, "video_prompt_media_post")
-			if err == nil {
-				break
-			}
-			if attempt > 0 || !isWebMediaAntiBotError(err) {
-				return provider.VideoResult{}, err
-			}
-			a.logVideoAntiBotRetry(request, "video_prompt_media_post")
-			lease, err = a.refreshVideoLease(ctx, lease, request.Credential)
-			if err != nil {
-				return provider.VideoResult{}, err
-			}
+		parentID, err = a.createMediaPost(ctx, cfg, lease, token, "MEDIA_POST_TYPE_VIDEO", "", request.Prompt, "video_prompt_media_post")
+		if err != nil {
+			return provider.VideoResult{}, err
 		}
 	}
 	segments := videoSegments(request.Duration)
@@ -334,73 +283,62 @@ func (a *Adapter) GenerateVideo(ctx context.Context, request provider.VideoReque
 		resolution = "720p"
 	}
 	payload := videoCreatePayload(request.Prompt, parentID, ratio, resolution, segments[0], referenceAssetIDs)
-	endpoint := cfg.BaseURL + "/rest/app-chat/conversations/new"
-	for attempt := 0; attempt < 2; attempt++ {
-		response, requestErr := a.postJSON(ctx, cfg, lease, token, endpoint, payload, time.Duration(cfg.VideoTimeoutSeconds)*time.Second)
-		if requestErr != nil {
-			return provider.VideoResult{}, requestErr
-		}
-		outcome, parseErr := parseVideoStreamDetailed(response, request.Progress)
-		_ = response.Body.Close()
-		if parseErr != nil {
-			if upstreamErr, ok := parseErr.(*webMediaUpstreamError); ok {
-				a.logWebMediaUpstreamRejection("video_generation_submit", response, upstreamErr)
-			}
-			if attempt == 0 && isWebMediaAntiBotError(parseErr) {
-				a.logVideoAntiBotRetry(request, "video_generation_submit")
-				lease, err = a.refreshVideoLease(ctx, lease, request.Credential)
-				if err != nil {
-					return provider.VideoResult{}, err
-				}
-				continue
-			}
-			return provider.VideoResult{}, parseErr
-		}
-		result, reconstructed, resultErr := outcome.finalResult(request.Credential.UserID)
-		a.log().Info(
-			"video_generation_stream_terminal",
-			"job_id", request.JobID,
-			"account_id", request.Credential.ID,
-			"response_shape", outcome.responseShape,
-			"last_progress", outcome.lastProgress,
-			"completed", outcome.completed,
-			"moderated", outcome.moderated,
-			"video_id_present", outcome.videoID != "",
-			"video_url_present", outcome.result.URL != "",
-			"url_reconstructed", reconstructed,
-		)
-		if resultErr != nil {
-			return provider.VideoResult{}, resultErr
-		}
-		if reconstructed {
-			a.log().Warn(
-				"video_generation_url_reconstructed",
-				"job_id", request.JobID,
-				"account_id", request.Credential.ID,
-				"last_progress", outcome.lastProgress,
-			)
-		}
-		return result, nil
-	}
-	return provider.VideoResult{}, errors.New("视频生成 anti-bot 重试耗尽")
-}
-
-func (a *Adapter) refreshVideoLease(ctx context.Context, current *egress.Lease, credential account.Credential) (*egress.Lease, error) {
-	current.Release()
-	lease, err := a.egress.AcquireCredential(egress.WithPhysicalCallStage(ctx, "anti_bot_retry"), domainegress.ScopeWeb, credential)
+	response, err := a.postJSON(ctx, cfg, lease, token, cfg.BaseURL+"/rest/app-chat/conversations/new", payload, time.Duration(cfg.VideoTimeoutSeconds)*time.Second)
 	if err != nil {
-		return nil, fmt.Errorf("刷新视频 anti-bot 会话: %w", err)
+		return provider.VideoResult{}, err
 	}
-	return lease, nil
-}
-
-func (a *Adapter) logVideoAntiBotRetry(request provider.VideoRequest, stage string) {
-	a.log().Warn(
-		"video_generation_antibot_retry",
+	outcome, parseErr := parseVideoStreamDetailed(response, request.Progress)
+	_ = response.Body.Close()
+	if parseErr != nil {
+		if upstreamErr, ok := parseErr.(*webMediaUpstreamError); ok {
+			a.logWebMediaUpstreamRejection("video_generation", response, upstreamErr)
+		}
+		return provider.VideoResult{}, parseErr
+	}
+	result, reconstructed, resultErr := outcome.finalResult(request.Credential.UserID)
+	a.log().Info(
+		"video_generation_stream_terminal",
 		"job_id", request.JobID,
 		"account_id", request.Credential.ID,
-		"stage", stage,
+		"response_shape", outcome.responseShape,
+		"last_progress", outcome.lastProgress,
+		"completed", outcome.completed,
+		"moderated", outcome.moderated,
+		"video_id_present", outcome.videoID != "",
+		"video_url_present", outcome.result.URL != "",
+		"url_reconstructed", reconstructed,
 	)
+	if resultErr != nil {
+		return provider.VideoResult{}, resultErr
+	}
+	if reconstructed {
+		a.log().Warn(
+			"video_generation_url_reconstructed",
+			"job_id", request.JobID,
+			"account_id", request.Credential.ID,
+			"last_progress", outcome.lastProgress,
+		)
+	}
+	return result, nil
+}
+
+func (a *Adapter) prepareVideoReference(ctx context.Context, cfg Config, lease *egress.Lease, token, value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", fmt.Errorf("视频参考图片 URL 不能为空")
+	}
+	image, err := a.loadChatImage(ctx, lease, value, 20<<20)
+	if err != nil {
+		return "", err
+	}
+	uploaded, err := a.uploadFileV2Direct(ctx, cfg, lease, token, image, cfg.BaseURL+"/imagine", imagineSelfUploadSource, "video_reference_upload")
+	if err != nil {
+		return "", err
+	}
+	if uploaded.ID == "" {
+		return "", fmt.Errorf("上传视频参考图片后未返回 fileMetadataId")
+	}
+	return uploaded.ID, nil
 }
 
 type videoContentReadCloser struct {
