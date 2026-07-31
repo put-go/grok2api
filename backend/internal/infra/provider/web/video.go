@@ -31,6 +31,35 @@ type webMediaUpstreamError struct {
 	cloudflareChallenge bool
 }
 
+type webVideoIncompleteError struct {
+	lastProgress   int
+	completed      bool
+	videoIDPresent bool
+	userIDPresent  bool
+}
+
+func (e *webVideoIncompleteError) Error() string {
+	if e == nil {
+		return ""
+	}
+	if e.completed {
+		return fmt.Sprintf(
+			"视频生成已完成但响应没有可用内容 URL（video_id=%t, user_id=%t）",
+			e.videoIDPresent,
+			e.userIDPresent,
+		)
+	}
+	return fmt.Sprintf(
+		"视频生成响应提前结束（last_progress=%d, video_id=%t）",
+		e.lastProgress,
+		e.videoIDPresent,
+	)
+}
+
+func (*webVideoIncompleteError) HTTPStatusCode() int {
+	return http.StatusBadGateway
+}
+
 func (e *webMediaUpstreamError) Error() string {
 	if e == nil {
 		return ""
@@ -254,7 +283,7 @@ func (a *Adapter) GenerateVideo(ctx context.Context, request provider.VideoReque
 	if err != nil {
 		return provider.VideoResult{}, err
 	}
-	result, _, parseErr := parseVideoStream(response, request.Progress)
+	outcome, parseErr := parseVideoStreamDetailed(response, request.Progress)
 	_ = response.Body.Close()
 	if parseErr != nil {
 		if upstreamErr, ok := parseErr.(*webMediaUpstreamError); ok {
@@ -262,8 +291,17 @@ func (a *Adapter) GenerateVideo(ctx context.Context, request provider.VideoReque
 		}
 		return provider.VideoResult{}, parseErr
 	}
-	if result.URL == "" {
-		return provider.VideoResult{}, fmt.Errorf("视频生成完成但没有返回内容 URL")
+	result, reconstructed, resultErr := outcome.finalResult(request.Credential.UserID)
+	if resultErr != nil {
+		return provider.VideoResult{}, resultErr
+	}
+	if reconstructed {
+		a.log().Warn(
+			"video_generation_url_reconstructed",
+			"job_id", request.JobID,
+			"account_id", request.Credential.ID,
+			"last_progress", outcome.lastProgress,
+		)
 	}
 	return result, nil
 }
@@ -348,20 +386,83 @@ func (a *Adapter) DownloadVideo(ctx context.Context, credential account.Credenti
 	return &videoContentReadCloser{ReadCloser: response.Body, release: lease.Release}, contentType, response.ContentLength, nil
 }
 
+type videoStreamOutcome struct {
+	result       provider.VideoResult
+	videoID      string
+	postID       string
+	userID       string
+	lastProgress int
+	completed    bool
+	moderated    bool
+}
+
+func (o videoStreamOutcome) finalResult(credentialUserID string) (provider.VideoResult, bool, error) {
+	if o.moderated {
+		return provider.VideoResult{}, false, fmt.Errorf("视频生成被上游内容审核拦截")
+	}
+	if o.result.URL != "" {
+		return o.result, false, nil
+	}
+	userID := strings.TrimSpace(o.userID)
+	if userID == "" {
+		userID = strings.TrimSpace(credentialUserID)
+	}
+	videoID := strings.TrimSpace(o.videoID)
+	if o.completed && userID != "" && videoID != "" {
+		return provider.VideoResult{
+			URL:         generatedVideoAssetURL(userID, videoID),
+			ContentType: "video/mp4",
+		}, true, nil
+	}
+	return provider.VideoResult{}, false, &webVideoIncompleteError{
+		lastProgress:   o.lastProgress,
+		completed:      o.completed,
+		videoIDPresent: videoID != "",
+		userIDPresent:  userID != "",
+	}
+}
+
+func generatedVideoAssetURL(userID, videoID string) string {
+	return absoluteAssetURL("users/" + url.PathEscape(userID) + "/generated/" + url.PathEscape(videoID) + "/generated_video.mp4")
+}
+
+func videoUserIDFromAssetReference(value string) string {
+	parsed, err := url.Parse(strings.TrimSpace(value))
+	if err != nil || parsed.Scheme != "https" || !trustedImageAssetHost(parsed.Hostname()) || parsed.User != nil {
+		return ""
+	}
+	parts := strings.Split(strings.Trim(parsed.Path, "/"), "/")
+	if len(parts) < 3 || parts[0] != "users" || parts[1] == "_" {
+		return ""
+	}
+	userID, err := url.PathUnescape(parts[1])
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(userID)
+}
+
 func parseVideoStream(response *http.Response, progress func(int)) (provider.VideoResult, string, error) {
+	outcome, err := parseVideoStreamDetailed(response, progress)
+	if err != nil {
+		return provider.VideoResult{}, "", err
+	}
+	return outcome.result, outcome.postID, nil
+}
+
+func parseVideoStreamDetailed(response *http.Response, progress func(int)) (videoStreamOutcome, error) {
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		body, _ := io.ReadAll(io.LimitReader(response.Body, webMediaDiagnosticBodyLimit+1))
 		if response.StatusCode == http.StatusUnauthorized {
-			return provider.VideoResult{}, "", provider.ErrUnauthorized
+			return videoStreamOutcome{}, provider.ErrUnauthorized
 		}
 		truncated := len(body) > webMediaDiagnosticBodyLimit
 		if truncated {
 			body = body[:webMediaDiagnosticBodyLimit]
 		}
-		return provider.VideoResult{}, "", newWebMediaUpstreamError(response.StatusCode, body, truncated)
+		return videoStreamOutcome{}, newWebMediaUpstreamError(response.StatusCode, body, truncated)
 	}
-	var result provider.VideoResult
-	var postID string
+	var outcome videoStreamOutcome
 	handle := func(root map[string]any) (bool, error) {
 		if errorValue, ok := root["error"].(map[string]any); ok {
 			return false, webMediaStreamError(errorValue)
@@ -371,25 +472,40 @@ func parseVideoStream(response *http.Response, progress func(int)) (provider.Vid
 		}
 		stream := nestedMap(root, "result", "response", "streamingVideoGenerationResponse")
 		if stream != nil {
-			if value, ok := numberAsInt(stream["progress"]); ok && progress != nil {
-				progress(value)
+			if value, ok := numberAsInt(stream["progress"]); ok {
+				outcome.lastProgress = max(outcome.lastProgress, value)
+				outcome.completed = outcome.completed || value >= 100
+				if progress != nil {
+					progress(value)
+				}
 			}
-			if value, _ := stream["videoPostId"].(string); value != "" {
-				postID = value
-			} else if value, _ := stream["videoId"].(string); value != "" {
-				postID = value
+			if value := firstString(stream, "assetId", "videoId", "videoPostId"); value != "" {
+				outcome.videoID = value
+			}
+			if value := firstString(stream, "videoPostId", "videoId"); value != "" {
+				outcome.postID = value
+			}
+			if value := videoUserIDFromAssetReference(firstString(stream, "imageReference")); value != "" {
+				outcome.userID = value
 			}
 			moderated, _ := stream["moderated"].(bool)
 			if moderated {
+				outcome.moderated = true
 				return false, nil
 			}
-			if setVideoResultURL(&result, firstString(stream, "videoUrl", "contentUrl", "contentURL", "assetUrl", "assetURL", "fileUri", "fileURL")) {
+			if setVideoResultURL(&outcome.result, firstString(stream, "videoUrl", "contentUrl", "contentURL", "assetUrl", "assetURL", "fileUri", "fileURL")) {
+				outcome.completed = true
 				return true, nil
 			}
 		}
 		for _, attachment := range videoFileAttachments(root) {
-			if setVideoResultURL(&result, attachment) {
+			if setVideoResultURL(&outcome.result, attachment) {
+				outcome.completed = true
 				return true, nil
+			}
+			if !strings.ContainsAny(attachment, "/\\") {
+				outcome.videoID = strings.TrimSpace(attachment)
+				outcome.completed = outcome.videoID != ""
 			}
 		}
 		return false, nil
@@ -405,9 +521,9 @@ func parseVideoStream(response *http.Response, progress func(int)) (provider.Vid
 		err = consumeVideoJSON(reader, handle)
 	}
 	if err != nil {
-		return provider.VideoResult{}, "", err
+		return videoStreamOutcome{}, err
 	}
-	return result, postID, nil
+	return outcome, nil
 }
 
 func webMediaStreamError(value map[string]any) error {

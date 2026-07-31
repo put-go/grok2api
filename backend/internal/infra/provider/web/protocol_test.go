@@ -1466,6 +1466,73 @@ func TestParseVideoStreamUsesModelResponseAttachment(t *testing.T) {
 	}
 }
 
+func TestParseVideoCapturedSingleReferenceResponse(t *testing.T) {
+	fixture := `{"result":{"conversation":{"conversationId":"conversation_1"}}}` +
+		`{"result":{"response":{"streamingVideoGenerationResponse":{"videoId":"video_1","progress":95,"imageReference":"https://assets.grok.com/users/user_1/reference_1/content","moderated":false,"videoPostId":"video_1"}}}}` +
+		`{"result":{"response":{"streamingVideoGenerationResponse":{"videoId":"video_1","progress":100,"assetId":"video_1","videoUrl":"users/user_1/generated/video_1/generated_video.mp4","imageReference":"https://assets.grok.com/users/user_1/reference_1/content","moderated":false,"videoPostId":"video_1"}}}}` +
+		`{"result":{"response":{"token":"I generated a video","isSoftStop":true}}}`
+	response := &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(fixture))}
+	outcome, err := parseVideoStreamDetailed(response, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, reconstructed, err := outcome.finalResult("")
+	if err != nil || reconstructed || !outcome.completed || outcome.lastProgress != 100 || outcome.videoID != "video_1" || outcome.userID != "user_1" {
+		t.Fatalf("outcome=%#v reconstructed=%t err=%v", outcome, reconstructed, err)
+	}
+	if result.URL != "https://assets.grok.com/users/user_1/generated/video_1/generated_video.mp4" || result.ContentType != "video/mp4" {
+		t.Fatalf("result=%#v", result)
+	}
+}
+
+func TestVideoStreamReconstructsCompletedAssetURL(t *testing.T) {
+	fixture := `{"result":{"response":{"streamingVideoGenerationResponse":{"videoId":"video_1","progress":100,"assetId":"video_1","imageReference":"https://assets.grok.com/users/user_1/reference_1/content","moderated":false}}}}`
+	response := &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(fixture))}
+	outcome, err := parseVideoStreamDetailed(response, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, reconstructed, err := outcome.finalResult("")
+	if err != nil || !reconstructed || result.URL != "https://assets.grok.com/users/user_1/generated/video_1/generated_video.mp4" || result.ContentType != "video/mp4" {
+		t.Fatalf("result=%#v reconstructed=%t err=%v outcome=%#v", result, reconstructed, err, outcome)
+	}
+}
+
+func TestVideoStreamPrefersVerifiedResponseUserForReconstruction(t *testing.T) {
+	outcome := videoStreamOutcome{videoID: "video_1", userID: "response_user", lastProgress: 100, completed: true}
+	result, reconstructed, err := outcome.finalResult("stale_credential_user")
+	if err != nil || !reconstructed || result.URL != "https://assets.grok.com/users/response_user/generated/video_1/generated_video.mp4" {
+		t.Fatalf("result=%#v reconstructed=%t err=%v", result, reconstructed, err)
+	}
+}
+
+func TestVideoStreamRejectsPrematureEOFWithoutReconstruction(t *testing.T) {
+	fixture := `{"result":{"response":{"streamingVideoGenerationResponse":{"videoId":"video_1","progress":95,"imageReference":"https://assets.grok.com/users/user_1/reference_1/content","moderated":false}}}}`
+	response := &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(fixture))}
+	outcome, err := parseVideoStreamDetailed(response, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, reconstructed, err := outcome.finalResult("")
+	var incomplete *webVideoIncompleteError
+	if reconstructed || !errors.As(err, &incomplete) || incomplete.HTTPStatusCode() != http.StatusBadGateway || incomplete.lastProgress != 95 {
+		t.Fatalf("reconstructed=%t err=%#v outcome=%#v", reconstructed, err, outcome)
+	}
+}
+
+func TestVideoStreamDoesNotReconstructModeratedResult(t *testing.T) {
+	fixture := `{"result":{"response":{"streamingVideoGenerationResponse":{"videoId":"video_1","progress":100,"imageReference":"https://assets.grok.com/users/user_1/reference_1/content","moderated":true}}}}`
+	response := &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(fixture))}
+	outcome, err := parseVideoStreamDetailed(response, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, reconstructed, err := outcome.finalResult("")
+	if reconstructed || err == nil || !strings.Contains(err.Error(), "审核") {
+		t.Fatalf("reconstructed=%t err=%v outcome=%#v", reconstructed, err, outcome)
+	}
+}
+
 func MarshalJSONBytes(value any) []byte {
 	data, _ := json.Marshal(value)
 	return data
