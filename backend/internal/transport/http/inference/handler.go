@@ -176,16 +176,29 @@ type modelListItem struct {
 }
 
 func (h *Handler) listModels(c *gin.Context) {
-	values, err := h.models.ListEnabled(c.Request.Context())
+	allowAliases := false
+	var clientKey clientkeydomain.Key
+	hasClientKey := false
+	if clientValue, exists := c.Get(middleware.ClientKey); exists {
+		if value, ok := clientValue.(clientkeydomain.Key); ok {
+			clientKey = value
+			hasClientKey = true
+			allowAliases = clientKey.AllowModelAliases
+		}
+	}
+	var values []modeldomain.Route
+	var err error
+	if hasClientKey {
+		values, err = h.models.ListEnabledForClientKey(c.Request.Context(), clientKey)
+	} else {
+		values, err = h.models.ListEnabled(c.Request.Context())
+	}
 	if err != nil {
 		writeOpenAIError(c, http.StatusInternalServerError, "model_list_failed", "读取模型列表失败")
 		return
 	}
-	allowAliases := false
-	if clientValue, exists := c.Get(middleware.ClientKey); exists {
-		if clientKey, ok := clientValue.(clientkeydomain.Key); ok {
-			allowAliases = clientKey.AllowModelAliases
-		}
+	if hasClientKey {
+		values = filterModelRoutesForClientKey(values, clientKey)
 	}
 	items := newModelListItems(values)
 	if allowAliases {
@@ -196,6 +209,17 @@ func (h *Handler) listModels(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"object": "list", "data": items})
+}
+
+func filterModelRoutesForClientKey(values []modeldomain.Route, key clientkeydomain.Key) []modeldomain.Route {
+	filtered := make([]modeldomain.Route, 0, len(values))
+	scope := key.AccountScope()
+	for _, value := range values {
+		if scope.AllowsProvider(value.Provider) && key.AllowsModel(value.ID) {
+			filtered = append(filtered, value)
+		}
+	}
+	return filtered
 }
 
 // newModelListItems deduplicates by downstream public name and hides Provider prefixes used only for internal routing.
@@ -631,8 +655,12 @@ func (h *Handler) generateVideo(c *gin.Context) {
 	if request.Image != nil {
 		inputs = append([]videoGenerationImage{*request.Image}, inputs...)
 	}
-	if len(inputs) > mediadomain.MaxInputImages {
-		writeOpenAIError(c, http.StatusBadRequest, "invalid_request", fmt.Sprintf("image 与 reference_images 合计不能超过 %d 张", mediadomain.MaxInputImages))
+	if len(inputs) > mediadomain.MaxReferenceImages {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request", fmt.Sprintf("image 与 reference_images 合计不能超过 %d 张", mediadomain.MaxReferenceImages))
+		return
+	}
+	if len(inputs) > 1 && duration > mediadomain.MaxReferenceVideoDuration {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request", fmt.Sprintf("多参考图视频的 duration 不能超过 %d 秒", mediadomain.MaxReferenceVideoDuration))
 		return
 	}
 	referenceURLs := make([]string, 0, len(inputs))
@@ -740,8 +768,8 @@ func parseVideoDuration(durationRaw json.RawMessage) (int, error) {
 	if hasDuration {
 		value = duration
 	}
-	if value < 1 || value > 15 {
-		return 0, fmt.Errorf("duration 必须在 1 到 15 秒之间")
+	if value < 1 || value > mediadomain.MaxVideoDuration {
+		return 0, fmt.Errorf("duration 必须在 1 到 %d 秒之间", mediadomain.MaxVideoDuration)
 	}
 	return value, nil
 }
@@ -1636,6 +1664,9 @@ func writeGatewayError(c *gin.Context, err error) {
 	case errors.Is(err, clientkeyapp.ErrBillingLimit):
 		status, code = http.StatusTooManyRequests, "billing_limit_exceeded"
 		message = clientkeyapp.ErrBillingLimit.Error()
+	case errors.Is(err, clientkeyapp.ErrModelNotAllowed):
+		status, code = http.StatusForbidden, "model_not_allowed"
+		message = clientkeyapp.ErrModelNotAllowed.Error()
 	case errors.Is(err, gateway.ErrModelNotFound):
 		status, code = http.StatusNotFound, "model_not_found"
 		message = "模型不存在"
@@ -1684,6 +1715,9 @@ func writeGatewayAnthropicError(c *gin.Context, err error) {
 	case errors.Is(err, clientkeyapp.ErrBillingLimit):
 		status, errorType = http.StatusTooManyRequests, "rate_limit_error"
 		message = clientkeyapp.ErrBillingLimit.Error()
+	case errors.Is(err, clientkeyapp.ErrModelNotAllowed):
+		status, errorType, clientCode = http.StatusForbidden, "permission_error", "model_not_allowed"
+		message = clientkeyapp.ErrModelNotAllowed.Error()
 	case errors.Is(err, gateway.ErrModelNotFound):
 		status, errorType = http.StatusNotFound, "not_found_error"
 		message = "模型不存在"
@@ -1710,7 +1744,7 @@ func writeGatewayAnthropicError(c *gin.Context, err error) {
 			errorType = "rate_limit_error"
 		}
 	case errors.As(err, &selectionFailure):
-		status, _, message = selectionErrorResponse(c, selectionFailure)
+		status, clientCode, message = selectionErrorResponse(c, selectionFailure)
 		if status == http.StatusTooManyRequests {
 			errorType = "rate_limit_error"
 		} else {
@@ -1738,17 +1772,21 @@ func selectionErrorResponse(c *gin.Context, failure *gateway.SelectionUnavailabl
 		return status, code, message
 	}
 	status, code = failure.HTTPStatus(), failure.Code()
-	switch failure.Reason {
-	case gateway.SelectionCooling:
-		message = "上游账号正在冷却"
-	case gateway.SelectionModelCooling:
-		message = "上游账号的目标模型正在冷却"
-	case gateway.SelectionQuotaExhausted:
-		message = "上游账号额度等待恢复"
-	case gateway.SelectionSaturated:
-		message = "上游账号当前均达到并发上限"
-	case gateway.SelectionUnsupportedModel:
-		message = "当前账号池不支持该模型"
+	if failure.Scope.IsRestricted() {
+		message = failure.Error()
+	} else {
+		switch failure.Reason {
+		case gateway.SelectionCooling:
+			message = "上游账号正在冷却"
+		case gateway.SelectionModelCooling:
+			message = "上游账号的目标模型正在冷却"
+		case gateway.SelectionQuotaExhausted:
+			message = "上游账号额度等待恢复"
+		case gateway.SelectionSaturated:
+			message = "上游账号当前均达到并发上限"
+		case gateway.SelectionUnsupportedModel:
+			message = "当前账号池不支持该模型"
+		}
 	}
 	if failure.RetryAfter > 0 {
 		seconds := max(int64(1), int64((failure.RetryAfter+time.Second-1)/time.Second))

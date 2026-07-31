@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"math"
 	"net/http"
@@ -13,7 +14,9 @@ import (
 	"time"
 	"unicode/utf8"
 
+	clientkeyapp "github.com/chenyme/grok2api/backend/internal/application/clientkey"
 	"github.com/chenyme/grok2api/backend/internal/application/gateway"
+	clientkeydomain "github.com/chenyme/grok2api/backend/internal/domain/clientkey"
 	mediadomain "github.com/chenyme/grok2api/backend/internal/domain/media"
 	"github.com/gin-gonic/gin"
 )
@@ -50,6 +53,44 @@ func TestVideoGenerationUsesOfficialXAIEndpointsAndFields(t *testing.T) {
 	router.ServeHTTP(invalidRecorder, invalidDuration)
 	if invalidRecorder.Code != http.StatusBadRequest || !strings.Contains(invalidRecorder.Body.String(), "1 到 15") {
 		t.Fatalf("invalid duration status=%d body=%s", invalidRecorder.Code, invalidRecorder.Body.String())
+	}
+
+	multiReferenceTooLong := httptest.NewRequest(http.MethodPost, "/v1/videos/generations", strings.NewReader(`{
+		"model":"grok-imagine-video","prompt":"test","duration":11,
+		"reference_images":[{"url":"https://example.com/1.png"},{"url":"https://example.com/2.png"}]
+	}`))
+	multiReferenceTooLong.Header.Set("Content-Type", "application/json")
+	multiReferenceRecorder := httptest.NewRecorder()
+	router.ServeHTTP(multiReferenceRecorder, multiReferenceTooLong)
+	if multiReferenceRecorder.Code != http.StatusBadRequest || !strings.Contains(multiReferenceRecorder.Body.String(), "不能超过 10 秒") {
+		t.Fatalf("multi-reference duration status=%d body=%s", multiReferenceRecorder.Code, multiReferenceRecorder.Body.String())
+	}
+
+	eightReferences := make([]videoGenerationImage, 8)
+	for index := range eightReferences {
+		eightReferences[index].URL = fmt.Sprintf("https://example.com/%d.png", index)
+	}
+	eightReferenceBody, err := json.Marshal(videoGenerationRequest{Model: "grok-imagine-video", Prompt: "test", ReferenceImages: eightReferences})
+	if err != nil {
+		t.Fatal(err)
+	}
+	eightReferenceRequest := httptest.NewRequest(http.MethodPost, "/v1/videos/generations", bytes.NewReader(eightReferenceBody))
+	eightReferenceRequest.Header.Set("Content-Type", "application/json")
+	eightReferenceRecorder := httptest.NewRecorder()
+	router.ServeHTTP(eightReferenceRecorder, eightReferenceRequest)
+	if eightReferenceRecorder.Code != http.StatusBadRequest || !strings.Contains(eightReferenceRecorder.Body.String(), "不能超过 7 张") {
+		t.Fatalf("reference count status=%d body=%s", eightReferenceRecorder.Code, eightReferenceRecorder.Body.String())
+	}
+
+	singleReferenceFifteenSeconds := httptest.NewRequest(http.MethodPost, "/v1/videos/generations", strings.NewReader(`{
+		"model":"grok-imagine-video","prompt":"test","duration":15,
+		"reference_images":[{"url":"https://example.com/1.png"}]
+	}`))
+	singleReferenceFifteenSeconds.Header.Set("Content-Type", "application/json")
+	singleReferenceRecorder := httptest.NewRecorder()
+	router.ServeHTTP(singleReferenceRecorder, singleReferenceFifteenSeconds)
+	if singleReferenceRecorder.Code != http.StatusUnauthorized {
+		t.Fatalf("single-reference duration status=%d body=%s", singleReferenceRecorder.Code, singleReferenceRecorder.Body.String())
 	}
 
 	valid := httptest.NewRequest(http.MethodPost, "/v1/videos/generations", strings.NewReader(`{
@@ -162,6 +203,34 @@ func TestGatewayErrorMapsLedgerUnavailableToServiceUnavailable(t *testing.T) {
 	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/", nil))
 	if recorder.Code != http.StatusServiceUnavailable || !strings.Contains(recorder.Body.String(), `"code":"ledger_unavailable"`) {
 		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestGatewayErrorMapsDisallowedModelWithoutCallingItUpstreamUnavailable(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	for _, test := range []struct {
+		name      string
+		anthropic bool
+		wantType  string
+	}{
+		{name: "openai", wantType: `"code":"model_not_allowed"`},
+		{name: "anthropic", anthropic: true, wantType: `"type":"permission_error"`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			router := gin.New()
+			router.GET("/", func(c *gin.Context) {
+				if test.anthropic {
+					writeGatewayAnthropicError(c, clientkeyapp.ErrModelNotAllowed)
+					return
+				}
+				writeGatewayError(c, clientkeyapp.ErrModelNotAllowed)
+			})
+			recorder := httptest.NewRecorder()
+			router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/", nil))
+			if recorder.Code != http.StatusForbidden || !strings.Contains(recorder.Body.String(), test.wantType) || strings.Contains(recorder.Body.String(), "upstream_unavailable") {
+				t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+			}
+		})
 	}
 }
 
@@ -954,6 +1023,7 @@ func TestSelectionErrorResponseDistinguishesCoolingAndSaturation(t *testing.T) {
 		{name: "cooling", failure: &gateway.SelectionUnavailableError{Reason: gateway.SelectionCooling, RetryAfter: 1500 * time.Millisecond}, status: http.StatusTooManyRequests, code: "upstream_cooling", retryAfter: "2"},
 		{name: "model cooling", failure: &gateway.SelectionUnavailableError{Reason: gateway.SelectionModelCooling, RetryAfter: time.Second}, status: http.StatusTooManyRequests, code: "upstream_model_cooling", retryAfter: "1"},
 		{name: "saturated", failure: &gateway.SelectionUnavailableError{Reason: gateway.SelectionSaturated, RetryAfter: time.Second}, status: http.StatusServiceUnavailable, code: "upstream_saturated", retryAfter: "1"},
+		{name: "scoped account range", failure: &gateway.SelectionUnavailableError{Reason: gateway.SelectionNoAccounts, Scope: clientkeydomain.AccountScope{Providers: clientkeydomain.ProviderScopeBuild, Tiers: clientkeydomain.TierScopeFree}}, status: http.StatusServiceUnavailable, code: "client_key_account_scope_unavailable"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			recorder := httptest.NewRecorder()

@@ -3,6 +3,7 @@ package web
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,16 +12,23 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/chenyme/grok2api/backend/internal/domain/account"
 	domainegress "github.com/chenyme/grok2api/backend/internal/domain/egress"
+	mediadomain "github.com/chenyme/grok2api/backend/internal/domain/media"
 	"github.com/chenyme/grok2api/backend/internal/infra/egress"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
 )
 
 type webMediaUpstreamError struct {
-	status  int
-	summary string
+	status              int
+	summary             string
+	bodyBytes           int
+	bodyTruncated       bool
+	bodyPrefixSHA256    string
+	bodyKind            string
+	cloudflareChallenge bool
 }
 
 func (e *webMediaUpstreamError) Error() string {
@@ -50,12 +58,80 @@ var (
 	webMediaJWTPattern           = regexp.MustCompile(`\beyJ[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}(?:\.[A-Za-z0-9_-]{12,})?\b`)
 	webMediaEmailPattern         = regexp.MustCompile(`(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b`)
 	webMediaURLPattern           = regexp.MustCompile(`https?://[^\s"'<>]+`)
+	webMediaLongTokenPattern     = regexp.MustCompile(`[A-Za-z0-9+/=_-]{256,}`)
 )
 
 // newWebMediaUpstreamError keeps the HTTP status while exposing only a
-// bounded, redacted summary to logs, persisted jobs, and API responses.
+// bounded, redacted summary through the error. Structured logs retain only
+// body metadata and a prefix hash, never the upstream response body itself.
 func newWebMediaUpstreamError(status int, body []byte, truncated bool) *webMediaUpstreamError {
-	return &webMediaUpstreamError{status: status, summary: summarizeWebMediaUpstreamError(status, body, truncated)}
+	digest := sha256.Sum256(body)
+	return &webMediaUpstreamError{
+		status:              status,
+		summary:             summarizeWebMediaUpstreamError(status, body, truncated),
+		bodyBytes:           len(body),
+		bodyTruncated:       truncated,
+		bodyPrefixSHA256:    fmt.Sprintf("%x", digest),
+		bodyKind:            classifyWebMediaDiagnosticBody(body),
+		cloudflareChallenge: isCloudflareChallengeBody(body),
+	}
+}
+
+func classifyWebMediaDiagnosticBody(body []byte) string {
+	if !utf8.Valid(body) {
+		return "binary"
+	}
+	trimmed := strings.TrimSpace(string(body))
+	if trimmed == "" {
+		return "empty"
+	}
+	if json.Valid(body) {
+		return "json"
+	}
+	lower := strings.ToLower(trimmed)
+	if strings.HasPrefix(lower, "<!doctype html") || strings.HasPrefix(lower, "<html") {
+		return "html"
+	}
+	for _, value := range trimmed {
+		if value < 0x20 && value != '\t' && value != '\r' && value != '\n' {
+			return "binary"
+		}
+	}
+	return "text"
+}
+
+func isCloudflareChallengeBody(body []byte) bool {
+	lower := strings.ToLower(string(body))
+	return strings.Contains(lower, "just a moment") ||
+		strings.Contains(lower, "challenge-platform") ||
+		strings.Contains(lower, "__cf_chl") ||
+		strings.Contains(lower, "cf-chl-")
+}
+
+func (a *Adapter) logWebMediaUpstreamRejection(stage string, response *http.Response, upstreamErr *webMediaUpstreamError) {
+	if upstreamErr == nil {
+		return
+	}
+	attributes := []any{
+		"stage", stage,
+		"status", upstreamErr.status,
+		"body_bytes_captured", upstreamErr.bodyBytes,
+		"body_truncated", upstreamErr.bodyTruncated,
+		"body_prefix_sha256", upstreamErr.bodyPrefixSHA256,
+		"body_kind", upstreamErr.bodyKind,
+		"cloudflare_challenge", upstreamErr.cloudflareChallenge,
+	}
+	if response != nil {
+		attributes = append(attributes,
+			"content_type", safeWebMediaDiagnostic(response.Header.Get("Content-Type"), 128),
+			"content_length", response.ContentLength,
+			"content_encoding", safeWebMediaDiagnostic(response.Header.Get("Content-Encoding"), 64),
+			"server", safeWebMediaDiagnostic(response.Header.Get("Server"), 128),
+			"cf_ray", safeWebMediaDiagnostic(response.Header.Get("CF-Ray"), 128),
+			"upstream_request_id", safeWebMediaDiagnostic(firstNonEmpty(response.Header.Get("X-Request-Id"), response.Header.Get("X-Xai-Request-Id")), 128),
+		)
+	}
+	a.log().Warn("web_media_upstream_rejected", attributes...)
 }
 
 func summarizeWebMediaUpstreamError(status int, body []byte, truncated bool) string {
@@ -117,6 +193,7 @@ func safeWebMediaDiagnostic(value string, limit int) string {
 	value = webMediaJWTPattern.ReplaceAllString(value, "[REDACTED]")
 	value = webMediaEmailPattern.ReplaceAllString(value, "[REDACTED_EMAIL]")
 	value = webMediaURLPattern.ReplaceAllString(value, "[REDACTED_URL]")
+	value = webMediaLongTokenPattern.ReplaceAllString(value, "[REDACTED_LONG_VALUE]")
 	return boundWebMediaDiagnostic(value, limit)
 }
 
@@ -132,6 +209,12 @@ func boundWebMediaDiagnostic(value string, limit int) string {
 }
 
 func (a *Adapter) GenerateVideo(ctx context.Context, request provider.VideoRequest) (provider.VideoResult, error) {
+	if len(request.ReferenceURLs) > mediadomain.MaxReferenceImages {
+		return provider.VideoResult{}, fmt.Errorf("视频参考图片不能超过 %d 张", mediadomain.MaxReferenceImages)
+	}
+	if len(request.ReferenceURLs) > 1 && request.Duration > mediadomain.MaxReferenceVideoDuration {
+		return provider.VideoResult{}, fmt.Errorf("多参考图视频的 duration 不能超过 %d 秒", mediadomain.MaxReferenceVideoDuration)
+	}
 	cfg := a.config()
 	token, err := a.cipher.Decrypt(request.Credential.EncryptedAccessToken)
 	if err != nil {
@@ -143,21 +226,19 @@ func (a *Adapter) GenerateVideo(ctx context.Context, request provider.VideoReque
 	}
 	defer lease.Release()
 	parentID := ""
-	references := make([]string, 0, len(request.ReferenceURLs))
+	referenceAssetIDs := make([]string, 0, len(request.ReferenceURLs))
 	for _, rawReference := range request.ReferenceURLs {
-		reference, referenceErr := a.prepareVideoReference(ctx, cfg, lease, token, rawReference)
+		assetID, referenceErr := a.prepareVideoReference(ctx, cfg, lease, token, rawReference)
 		if referenceErr != nil {
 			return provider.VideoResult{}, referenceErr
 		}
-		references = append(references, reference)
+		referenceAssetIDs = append(referenceAssetIDs, assetID)
 	}
-	if len(references) > 0 {
-		parentID, err = a.createMediaPost(ctx, cfg, lease, token, "MEDIA_POST_TYPE_IMAGE", references[0], "")
-	} else {
-		parentID, err = a.createMediaPost(ctx, cfg, lease, token, "MEDIA_POST_TYPE_VIDEO", "", request.Prompt)
-	}
-	if err != nil {
-		return provider.VideoResult{}, err
+	if len(referenceAssetIDs) == 0 {
+		parentID, err = a.createMediaPost(ctx, cfg, lease, token, "MEDIA_POST_TYPE_VIDEO", "", request.Prompt, "video_prompt_media_post")
+		if err != nil {
+			return provider.VideoResult{}, err
+		}
 	}
 	segments := videoSegments(request.Duration)
 	if len(segments) == 0 {
@@ -168,7 +249,7 @@ func (a *Adapter) GenerateVideo(ctx context.Context, request provider.VideoReque
 	if resolution == "" {
 		resolution = "720p"
 	}
-	payload := videoCreatePayload(request.Prompt, parentID, ratio, resolution, segments[0], references)
+	payload := videoCreatePayload(request.Prompt, parentID, ratio, resolution, segments[0], referenceAssetIDs)
 	response, err := a.postJSON(ctx, cfg, lease, token, cfg.BaseURL+"/rest/app-chat/conversations/new", payload, time.Duration(cfg.VideoTimeoutSeconds)*time.Second)
 	if err != nil {
 		return provider.VideoResult{}, err
@@ -176,6 +257,9 @@ func (a *Adapter) GenerateVideo(ctx context.Context, request provider.VideoReque
 	result, _, parseErr := parseVideoStream(response, request.Progress)
 	_ = response.Body.Close()
 	if parseErr != nil {
+		if upstreamErr, ok := parseErr.(*webMediaUpstreamError); ok {
+			a.logWebMediaUpstreamRejection("video_generation", response, upstreamErr)
+		}
 		return provider.VideoResult{}, parseErr
 	}
 	if result.URL == "" {
@@ -193,14 +277,14 @@ func (a *Adapter) prepareVideoReference(ctx context.Context, cfg Config, lease *
 	if err != nil {
 		return "", err
 	}
-	uploaded, err := a.uploadFileLegacy(ctx, cfg, lease, token, image, cfg.BaseURL+"/imagine")
+	uploaded, err := a.uploadFileV2Direct(ctx, cfg, lease, token, image, cfg.BaseURL+"/imagine", imagineSelfUploadSource, "video_reference_upload")
 	if err != nil {
 		return "", err
 	}
-	if uploaded.URI == "" {
-		return "", fmt.Errorf("上传视频参考图片后未返回 fileUri")
+	if uploaded.ID == "" {
+		return "", fmt.Errorf("上传视频参考图片后未返回 fileMetadataId")
 	}
-	return uploaded.URI, nil
+	return uploaded.ID, nil
 }
 
 type videoContentReadCloser struct {
@@ -327,8 +411,14 @@ func parseVideoStream(response *http.Response, progress func(int)) (provider.Vid
 }
 
 func webMediaStreamError(value map[string]any) error {
+	code := safeWebMediaDiagnostic(firstWebMediaDiagnosticCode(value, "code", "error_code", "type"), 64)
 	message := safeWebMediaDiagnostic(firstString(value, "message", "error", "detail"), webMediaDiagnosticFieldLimit)
-	if message == "" {
+	switch {
+	case code != "" && message != "":
+		message = code + ": " + message
+	case code != "":
+		message = code
+	case message == "":
 		message = "未提供错误详情"
 	}
 	return fmt.Errorf("视频上游错误: %s", message)
@@ -422,21 +512,48 @@ func nestedMap(value map[string]any, keys ...string) map[string]any {
 }
 
 func videoSegments(seconds int) []int {
-	if seconds < 1 || seconds > 15 {
+	if seconds < 1 || seconds > mediadomain.MaxVideoDuration {
 		return nil
 	}
 	return []int{seconds}
 }
 
-func videoCreatePayload(prompt, parentID, ratio, resolution string, seconds int, references []string) map[string]any {
-	config := map[string]any{"parentPostId": parentID, "aspectRatio": ratio, "videoLength": seconds, "resolutionName": resolution}
-	if len(references) > 0 {
-		config["isVideoEdit"] = false
-		config["isReferenceToVideo"] = true
-		config["imageReferences"] = references
+func videoCreatePayload(prompt, parentID, ratio, resolution string, seconds int, referenceAssetIDs []string) map[string]any {
+	if len(referenceAssetIDs) > 0 {
+		mode := "custom"
+		inputKind := "referenceToVideo"
+		input := map[string]any{
+			"prompt": prompt, "inputAssets": referenceAssetIDs, "aspectRatio": ratio,
+			"duration": seconds, "resolutionName": resolution,
+		}
+		if len(referenceAssetIDs) == 1 {
+			inputKind = "imageToVideo"
+			if strings.TrimSpace(prompt) == "" {
+				mode = "normal"
+			}
+			input["mode"] = mode
+		}
+		return map[string]any{
+			"modelName": "imagine-video-gen", "message": videoModeMessage(prompt, mode),
+			"enableImageStreaming": true, "enableSideBySide": true, "sendFinalMetadata": true,
+			"responseMetadata": map[string]any{
+				"experiments": []any{}, "modelConfigOverride": map[string]any{"modelMap": map[string]any{}},
+			},
+			"mediaGenInput": map[string]any{inputKind: input},
+			"kind":          "CONVERSATION_KIND_IMAGINE",
+		}
 	}
+	config := map[string]any{"parentPostId": parentID, "aspectRatio": ratio, "videoLength": seconds, "resolutionName": resolution}
 	return map[string]any{
 		"temporary": true, "modelName": "imagine-video-gen", "message": prompt + " --mode=custom", "enableSideBySide": true,
 		"responseMetadata": map[string]any{"experiments": []any{}, "modelConfigOverride": map[string]any{"modelMap": map[string]any{"videoGenModelConfig": config}}},
 	}
+}
+
+func videoModeMessage(prompt, mode string) string {
+	prompt = strings.TrimSpace(prompt)
+	if prompt == "" {
+		return "--mode=" + mode
+	}
+	return prompt + " --mode=" + mode
 }

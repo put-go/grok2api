@@ -15,8 +15,15 @@ const (
 // Keep the relational CHECK constraint and gateway encode guard aligned with this value.
 const MaxInputJSONBytes = 32 << 20
 
-// MaxInputImages is the maximum number of reference images accepted for a video job.
+// MaxInputImages is the persisted safety ceiling retained for historical jobs.
 const MaxInputImages = 8
+
+// Grok reference-to-video accepts at most seven images and ten seconds.
+const (
+	MaxReferenceImages        = 7
+	MaxReferenceVideoDuration = 10
+	MaxVideoDuration          = 15
+)
 
 // Job 表示可跨进程重启恢复的异步视频任务。
 type Job struct {
