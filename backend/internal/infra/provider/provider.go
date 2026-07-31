@@ -14,12 +14,14 @@ import (
 )
 
 var (
-	ErrAuthorizationPending = errors.New("authorization pending")
-	ErrSlowDown             = errors.New("authorization polling too fast")
-	ErrAuthorizationDenied  = errors.New("authorization denied")
-	ErrCredentialLimit      = errors.New("credential count exceeds limit")
-	ErrUnauthorized         = errors.New("upstream credential unauthorized")
-	ErrBirthDateAlreadySet  = errors.New("upstream birth date is already set")
+	ErrAuthorizationPending     = errors.New("authorization pending")
+	ErrSlowDown                 = errors.New("authorization polling too fast")
+	ErrAuthorizationDenied      = errors.New("authorization denied")
+	ErrCredentialLimit          = errors.New("credential count exceeds limit")
+	ErrUnauthorized             = errors.New("upstream credential unauthorized")
+	ErrBirthDateAlreadySet      = errors.New("upstream birth date is already set")
+	ErrContentPolicyViolation   = errors.New("视频生成被上游内容审核拦截")
+	ErrUpstreamStreamIncomplete = errors.New("上游响应流不完整")
 )
 
 // HTTPStatusError preserves the upstream status when a streaming or asynchronous Provider cannot return a Response.

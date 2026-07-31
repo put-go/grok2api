@@ -452,6 +452,16 @@ func TestVideoGenerationResponseMatchesOfficialPollingShape(t *testing.T) {
 	if failed["status"] != "failed" || !ok || errorValue["code"] != "service_unavailable" || failed["model"] != nil || failed["progress"] != nil {
 		t.Fatalf("failed response=%#v", failed)
 	}
+	moderated := videoGenerationResponse(mediadomain.Job{Status: mediadomain.StatusFailed, ErrorCode: "content_policy_violation", ErrorMessage: "blocked"})
+	moderationError, ok := moderated["error"].(gin.H)
+	if !ok || moderationError["code"] != "content_policy_violation" {
+		t.Fatalf("moderated response=%#v", moderated)
+	}
+	incomplete := videoGenerationResponse(mediadomain.Job{Status: mediadomain.StatusFailed, ErrorCode: "upstream_stream_incomplete", ErrorMessage: "stream ended"})
+	incompleteError, ok := incomplete["error"].(gin.H)
+	if !ok || incompleteError["code"] != "upstream_stream_incomplete" {
+		t.Fatalf("incomplete response=%#v", incomplete)
+	}
 }
 
 func TestImageGenerationEndpointValidatesXAIContractBeforeRouting(t *testing.T) {

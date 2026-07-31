@@ -850,6 +850,10 @@ func officialVideoErrorCode(value string) string {
 	switch value {
 	case "account_unavailable", "provider_unavailable":
 		return "service_unavailable"
+	case "content_policy_violation":
+		return "content_policy_violation"
+	case "upstream_stream_incomplete":
+		return "upstream_stream_incomplete"
 	case "model_not_found":
 		return "invalid_argument"
 	default:

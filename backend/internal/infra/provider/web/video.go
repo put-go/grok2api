@@ -56,6 +56,10 @@ func (e *webVideoIncompleteError) Error() string {
 	)
 }
 
+func (e *webVideoIncompleteError) Unwrap() error {
+	return provider.ErrUpstreamStreamIncomplete
+}
+
 func (*webVideoIncompleteError) HTTPStatusCode() int {
 	return http.StatusBadGateway
 }
@@ -292,6 +296,18 @@ func (a *Adapter) GenerateVideo(ctx context.Context, request provider.VideoReque
 		return provider.VideoResult{}, parseErr
 	}
 	result, reconstructed, resultErr := outcome.finalResult(request.Credential.UserID)
+	a.log().Info(
+		"video_generation_stream_terminal",
+		"job_id", request.JobID,
+		"account_id", request.Credential.ID,
+		"response_shape", outcome.responseShape,
+		"last_progress", outcome.lastProgress,
+		"completed", outcome.completed,
+		"moderated", outcome.moderated,
+		"video_id_present", outcome.videoID != "",
+		"video_url_present", outcome.result.URL != "",
+		"url_reconstructed", reconstructed,
+	)
 	if resultErr != nil {
 		return provider.VideoResult{}, resultErr
 	}
@@ -387,18 +403,19 @@ func (a *Adapter) DownloadVideo(ctx context.Context, credential account.Credenti
 }
 
 type videoStreamOutcome struct {
-	result       provider.VideoResult
-	videoID      string
-	postID       string
-	userID       string
-	lastProgress int
-	completed    bool
-	moderated    bool
+	result        provider.VideoResult
+	videoID       string
+	postID        string
+	userID        string
+	responseShape string
+	lastProgress  int
+	completed     bool
+	moderated     bool
 }
 
 func (o videoStreamOutcome) finalResult(credentialUserID string) (provider.VideoResult, bool, error) {
 	if o.moderated {
-		return provider.VideoResult{}, false, fmt.Errorf("视频生成被上游内容审核拦截")
+		return provider.VideoResult{}, false, provider.ErrContentPolicyViolation
 	}
 	if o.result.URL != "" {
 		return o.result, false, nil
@@ -467,11 +484,13 @@ func parseVideoStreamDetailed(response *http.Response, progress func(int)) (vide
 		if errorValue, ok := root["error"].(map[string]any); ok {
 			return false, webMediaStreamError(errorValue)
 		}
-		if errorValue := nestedMap(root, "result", "response", "error"); errorValue != nil {
+		payload, responseShape := videoResponsePayload(root)
+		if errorValue := nestedMap(payload, "error"); errorValue != nil {
 			return false, webMediaStreamError(errorValue)
 		}
-		stream := nestedMap(root, "result", "response", "streamingVideoGenerationResponse")
+		stream := nestedMap(payload, "streamingVideoGenerationResponse")
 		if stream != nil {
+			outcome.responseShape = responseShape
 			if value, ok := numberAsInt(stream["progress"]); ok {
 				outcome.lastProgress = max(outcome.lastProgress, value)
 				outcome.completed = outcome.completed || value >= 100
@@ -495,13 +514,16 @@ func parseVideoStreamDetailed(response *http.Response, progress func(int)) (vide
 			}
 			if setVideoResultURL(&outcome.result, firstString(stream, "videoUrl", "contentUrl", "contentURL", "assetUrl", "assetURL", "fileUri", "fileURL")) {
 				outcome.completed = true
-				return true, nil
 			}
 		}
-		for _, attachment := range videoFileAttachments(root) {
+		attachments := videoFileAttachments(payload)
+		if len(attachments) > 0 && outcome.responseShape == "" {
+			outcome.responseShape = responseShape
+		}
+		for _, attachment := range attachments {
 			if setVideoResultURL(&outcome.result, attachment) {
 				outcome.completed = true
-				return true, nil
+				continue
 			}
 			if !strings.ContainsAny(attachment, "/\\") {
 				outcome.videoID = strings.TrimSpace(attachment)
@@ -526,6 +548,17 @@ func parseVideoStreamDetailed(response *http.Response, progress func(int)) (vide
 	return outcome, nil
 }
 
+func videoResponsePayload(root map[string]any) (map[string]any, string) {
+	result := nestedMap(root, "result")
+	if result == nil {
+		return root, "root"
+	}
+	if response := nestedMap(result, "response"); response != nil {
+		return response, "result.response"
+	}
+	return result, "result"
+}
+
 func webMediaStreamError(value map[string]any) error {
 	code := safeWebMediaDiagnostic(firstWebMediaDiagnosticCode(value, "code", "error_code", "type"), 64)
 	message := safeWebMediaDiagnostic(firstString(value, "message", "error", "detail"), webMediaDiagnosticFieldLimit)
@@ -540,8 +573,8 @@ func webMediaStreamError(value map[string]any) error {
 	return fmt.Errorf("视频上游错误: %s", message)
 }
 
-func videoFileAttachments(root map[string]any) []string {
-	modelResponse := nestedMap(root, "result", "response", "modelResponse")
+func videoFileAttachments(payload map[string]any) []string {
+	modelResponse := nestedMap(payload, "modelResponse")
 	if modelResponse == nil {
 		return nil
 	}
@@ -581,8 +614,8 @@ func consumeVideoSSE(reader io.Reader, handle func(map[string]any) (bool, error)
 			continue
 		}
 		var root map[string]any
-		if json.Unmarshal([]byte(line), &root) != nil {
-			continue
+		if err := json.Unmarshal([]byte(line), &root); err != nil {
+			return fmt.Errorf("%w: 解析视频上游 SSE: %v", provider.ErrUpstreamStreamIncomplete, err)
 		}
 		complete, err := handle(root)
 		if err != nil {
@@ -592,7 +625,10 @@ func consumeVideoSSE(reader io.Reader, handle func(map[string]any) (bool, error)
 			return nil
 		}
 	}
-	return scanner.Err()
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("%w: 读取视频上游流: %v", provider.ErrUpstreamStreamIncomplete, err)
+	}
+	return nil
 }
 
 func consumeVideoJSON(reader io.Reader, handle func(map[string]any) (bool, error)) error {
@@ -603,7 +639,7 @@ func consumeVideoJSON(reader io.Reader, handle func(map[string]any) (bool, error
 			if err == io.EOF {
 				return nil
 			}
-			return fmt.Errorf("解析视频上游流: %w", err)
+			return fmt.Errorf("%w: 解析视频上游流: %v", provider.ErrUpstreamStreamIncomplete, err)
 		}
 		complete, err := handle(root)
 		if err != nil {

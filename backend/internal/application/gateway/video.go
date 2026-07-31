@@ -339,8 +339,11 @@ func (s *Service) runVideoJob(parent context.Context, job media.Job, route model
 			return
 		}
 		failureCtx, failureCancel := context.WithTimeout(context.Background(), finalizationTimeout)
-		failureHandled := false
-		if errors.Is(err, provider.ErrUnauthorized) {
+		failureHandled := isVideoRequestScopedFailure(err)
+		if failureHandled {
+			// Content moderation is scoped to this request. It must not cool down,
+			// rotate, or invalidate an otherwise healthy account.
+		} else if errors.Is(err, provider.ErrUnauthorized) {
 			if lease.Credential.AuthType == account.AuthTypeSSO {
 				s.markSSOCredentialRejected(failureCtx, lease.Credential, fmt.Sprintf("%s SSO credential rejected", lease.Credential.Provider))
 			}
@@ -383,10 +386,7 @@ func (s *Service) runVideoJob(parent context.Context, job media.Job, route model
 		failureCancel()
 		applyMediaJobEgress(&job, egressTrace, route.Provider)
 		s.logVideoGenerationFailure(job, lease.Credential, err)
-		failureCode, publicErr := "generation_failed", err
-		if status, ok := provider.ErrorHTTPStatus(err); errors.Is(err, provider.ErrUnauthorized) || (ok && (status == http.StatusUnauthorized || status == http.StatusForbidden)) {
-			failureCode, publicErr = "provider_unavailable", errors.New("上游服务暂不可用")
-		}
+		failureCode, publicErr := classifyVideoJobError(err)
 		s.failVideoJob(parent, job, failureCode, publicErr)
 		return
 	}
@@ -410,6 +410,23 @@ func (s *Service) runVideoJob(parent context.Context, job media.Job, route model
 	if quotaKind, _ := s.providers.QuotaKind(route.Provider); quotaKind == provider.QuotaRemoteWindow && lease.QuotaMode == "weekly" {
 		s.accounts.QueueQuotaRefresh(job.AccountID, lease.QuotaMode)
 	}
+}
+
+func classifyVideoJobError(err error) (string, error) {
+	switch {
+	case errors.Is(err, provider.ErrContentPolicyViolation):
+		return "content_policy_violation", provider.ErrContentPolicyViolation
+	case errors.Is(err, provider.ErrUpstreamStreamIncomplete):
+		return "upstream_stream_incomplete", err
+	}
+	if status, ok := provider.ErrorHTTPStatus(err); errors.Is(err, provider.ErrUnauthorized) || (ok && (status == http.StatusUnauthorized || status == http.StatusForbidden)) {
+		return "provider_unavailable", errors.New("上游服务暂不可用")
+	}
+	return "generation_failed", err
+}
+
+func isVideoRequestScopedFailure(err error) bool {
+	return errors.Is(err, provider.ErrContentPolicyViolation)
 }
 
 // persistRemoteVideo 只重试已经生成的视频结果下载与本地归档，不重新调用生成接口，
@@ -493,6 +510,8 @@ func (s *Service) recordVideoAudit(ctx context.Context, job media.Job, durationM
 		switch job.ErrorCode {
 		case "account_unavailable", "provider_unavailable":
 			statusCode = http.StatusServiceUnavailable
+		case "content_policy_violation":
+			statusCode = http.StatusBadRequest
 		case "model_not_found":
 			statusCode = http.StatusNotFound
 		}
