@@ -850,6 +850,8 @@ func officialVideoErrorCode(value string) string {
 	switch value {
 	case "account_unavailable", "provider_unavailable":
 		return "service_unavailable"
+	case "anti_bot_rejected":
+		return "anti_bot_rejected"
 	case "content_policy_violation":
 		return "content_policy_violation"
 	case "upstream_stream_incomplete":

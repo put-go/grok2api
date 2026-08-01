@@ -414,6 +414,8 @@ func (s *Service) runVideoJob(parent context.Context, job media.Job, route model
 
 func classifyVideoJobError(err error) (string, error) {
 	switch {
+	case errors.Is(err, provider.ErrAntiBotRejected):
+		return "anti_bot_rejected", provider.ErrAntiBotRejected
 	case errors.Is(err, provider.ErrContentPolicyViolation):
 		return "content_policy_violation", provider.ErrContentPolicyViolation
 	case errors.Is(err, provider.ErrUpstreamStreamIncomplete):
@@ -508,7 +510,7 @@ func (s *Service) recordVideoAudit(ctx context.Context, job media.Job, durationM
 	if job.Status == media.StatusFailed {
 		statusCode = http.StatusBadGateway
 		switch job.ErrorCode {
-		case "account_unavailable", "provider_unavailable":
+		case "account_unavailable", "provider_unavailable", "anti_bot_rejected":
 			statusCode = http.StatusServiceUnavailable
 		case "content_policy_violation":
 			statusCode = http.StatusBadRequest

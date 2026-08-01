@@ -77,6 +77,18 @@ func TestParseMediaPostResponsePreservesStatusAndPostID(t *testing.T) {
 	}
 }
 
+func TestWebMediaUpstreamErrorClassifiesAntiBotRejection(t *testing.T) {
+	antiBot := newWebMediaUpstreamError(http.StatusForbidden, []byte(`{"error":{"code":7,"message":"Request rejected by anti-bot rules."}}`), false)
+	if !errors.Is(antiBot, provider.ErrAntiBotRejected) {
+		t.Fatalf("anti-bot error = %#v", antiBot)
+	}
+
+	generic := newWebMediaUpstreamError(http.StatusForbidden, []byte(`{"error":{"code":"forbidden","message":"access denied"}}`), false)
+	if errors.Is(generic, provider.ErrAntiBotRejected) {
+		t.Fatalf("generic forbidden misclassified as anti-bot: %#v", generic)
+	}
+}
+
 func TestPostJSONDoesNotReplayForbiddenMediaRequest(t *testing.T) {
 	var calls atomic.Int64
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {

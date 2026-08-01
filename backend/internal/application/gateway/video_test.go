@@ -163,8 +163,10 @@ func TestClassifyVideoJobError(t *testing.T) {
 		name              string
 		err               error
 		wantCode          string
+		wantMessage       string
 		wantRequestScoped bool
 	}{
+		{name: "anti bot", err: fmt.Errorf("upstream detail: %w", provider.ErrAntiBotRejected), wantCode: "anti_bot_rejected", wantMessage: provider.ErrAntiBotRejected.Error()},
 		{name: "moderation", err: provider.ErrContentPolicyViolation, wantCode: "content_policy_violation", wantRequestScoped: true},
 		{name: "incomplete stream", err: fmt.Errorf("read failed: %w", provider.ErrUpstreamStreamIncomplete), wantCode: "upstream_stream_incomplete"},
 		{name: "forbidden", err: videoStatusError{status: http.StatusForbidden, message: "forbidden"}, wantCode: "provider_unavailable"},
@@ -172,9 +174,12 @@ func TestClassifyVideoJobError(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			code, _ := classifyVideoJobError(test.err)
+			code, publicErr := classifyVideoJobError(test.err)
 			if code != test.wantCode || isVideoRequestScopedFailure(test.err) != test.wantRequestScoped {
 				t.Fatalf("code=%q request_scoped=%t", code, isVideoRequestScopedFailure(test.err))
+			}
+			if test.wantMessage != "" && publicErr.Error() != test.wantMessage {
+				t.Fatalf("message=%q want=%q", publicErr.Error(), test.wantMessage)
 			}
 		})
 	}

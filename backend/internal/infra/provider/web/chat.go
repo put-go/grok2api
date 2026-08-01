@@ -988,7 +988,7 @@ func webResponseError(value map[string]any) error {
 
 func antiBotProviderResponse() *provider.Response {
 	return jsonProviderResponse(http.StatusForbidden, map[string]any{"error": map[string]any{
-		"message": "Grok Web 出口会话被上游反机器人规则拒绝，请检查代理、User-Agent 与 Cloudflare Cookie 是否来自同一浏览器会话",
+		"message": provider.ErrAntiBotRejected.Error(),
 		"type":    "upstream_error", "code": "anti_bot_rejected",
 	}})
 }

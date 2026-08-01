@@ -24,6 +24,7 @@ import (
 type webMediaUpstreamError struct {
 	status              int
 	summary             string
+	antiBotRejected     bool
 	bodyBytes           int
 	bodyTruncated       bool
 	bodyPrefixSHA256    string
@@ -78,6 +79,13 @@ func (e *webMediaUpstreamError) HTTPStatusCode() int {
 	return e.status
 }
 
+func (e *webMediaUpstreamError) Unwrap() error {
+	if e != nil && e.antiBotRejected {
+		return provider.ErrAntiBotRejected
+	}
+	return nil
+}
+
 const (
 	webMediaDiagnosticBodyLimit    = 64 << 10
 	webMediaDiagnosticSummaryLimit = 256
@@ -102,12 +110,21 @@ func newWebMediaUpstreamError(status int, body []byte, truncated bool) *webMedia
 	return &webMediaUpstreamError{
 		status:              status,
 		summary:             summarizeWebMediaUpstreamError(status, body, truncated),
+		antiBotRejected:     isWebMediaAntiBotRejection(status, body),
 		bodyBytes:           len(body),
 		bodyTruncated:       truncated,
 		bodyPrefixSHA256:    fmt.Sprintf("%x", digest),
 		bodyKind:            classifyWebMediaDiagnosticBody(body),
 		cloudflareChallenge: isCloudflareChallengeBody(body),
 	}
+}
+
+func isWebMediaAntiBotRejection(status int, body []byte) bool {
+	if status != http.StatusForbidden {
+		return false
+	}
+	code, message, structured := extractWebMediaUpstreamErrorFields(body)
+	return structured && (code == "7" || strings.Contains(strings.ToLower(message), "anti-bot"))
 }
 
 func classifyWebMediaDiagnosticBody(body []byte) string {

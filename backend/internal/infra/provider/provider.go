@@ -20,6 +20,7 @@ var (
 	ErrCredentialLimit          = errors.New("credential count exceeds limit")
 	ErrUnauthorized             = errors.New("upstream credential unauthorized")
 	ErrBirthDateAlreadySet      = errors.New("upstream birth date is already set")
+	ErrAntiBotRejected          = errors.New("请求被上游机器人风控拦截，请稍后重试")
 	ErrContentPolicyViolation   = errors.New("视频生成被上游内容审核拦截")
 	ErrUpstreamStreamIncomplete = errors.New("上游响应流不完整")
 )
