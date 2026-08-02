@@ -319,10 +319,12 @@ func applyDomainConfig(base config.Config, value settingsdomain.Config) config.C
 	if clearanceRefresh <= 0 {
 		clearanceRefresh = base.Provider.Web.ClearanceRefresh.Value()
 	}
+	statsigSignerURLOverride := base.Provider.Web.StatsigSignerURLOverride
 	base.Provider.Web = config.WebProviderConfig{
 		BaseURL: value.ProviderWeb.BaseURL, QuotaTimeout: config.Duration(value.ProviderWeb.QuotaTimeout),
 		StatsigMode: value.ProviderWeb.StatsigMode, StatsigManualValue: value.ProviderWeb.StatsigManualValue, StatsigSignerURL: value.ProviderWeb.StatsigSignerURL,
-		ClearanceMode: clearanceMode, FlareSolverrURL: flareSolverrURL,
+		StatsigSignerURLOverride: statsigSignerURLOverride,
+		ClearanceMode:            clearanceMode, FlareSolverrURL: flareSolverrURL,
 		ClearanceTimeout: config.Duration(clearanceTimeout), ClearanceRefresh: config.Duration(clearanceRefresh),
 		ChatTimeout: config.Duration(value.ProviderWeb.ChatTimeout), ImageTimeout: config.Duration(value.ProviderWeb.ImageTimeout),
 		VideoTimeout:     config.Duration(value.ProviderWeb.VideoTimeout),

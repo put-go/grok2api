@@ -154,6 +154,18 @@ cd grok2api
 cp config.example.yaml config.yaml
 ```
 
+将用于浏览器签名的 Grok 会员 SSO 写入本地 secret 文件：
+
+```bash
+install -d -m 700 .secrets
+read -rsp "Grok SSO: " GROK_SSO_TOKEN && echo
+printf '%s' "$GROK_SSO_TOKEN" > .secrets/grok-sso-token
+chmod 600 .secrets/grok-sso-token
+unset GROK_SSO_TOKEN
+```
+
+文件中只写原始 SSO Token，不要包含 `sso=`、Cookie 名或其他 Cookie。该目录已被 Git 和 Docker 构建上下文排除。
+
 生成密钥并写入 `config.yaml`：
 
 ```bash
@@ -174,12 +186,16 @@ bootstrapAdmin:
 启动服务：
 
 ```bash
-docker compose pull
-docker compose up -d
+docker compose up -d --build
 docker compose logs -f grok2api
+docker compose logs -f statsig-signer
 ```
 
 访问 `http://127.0.0.1:8000`。镜像已包含前端，SQLite 数据库与本地媒体保存在 Compose 数据卷中。
+
+Compose 会构建独立的 Playwright signer。它使用会员 SSO 建立真实 Grok 浏览器会话，调用当前网页代码为每个上游请求生成新的 `x-statsig-id`，且不暴露宿主机端口。网关只缓存一小时的页面 verification meta，不缓存 signer 返回的请求绑定签名；signer 不健康时网关不会启动。
+
+本地 signer 地址通过 `GROK2API_STATSIG_SIGNER_URL` 作为部署级覆盖，即使数据库仍保存手动签名模式也会使用动态 signer。签名浏览器的 Cookie 不会导出给 Go 网关；如果网关出口仍被 Cloudflare 拒绝，需要继续在“出口代理”中配置匹配实际出口的 User-Agent 与 Cloudflare Cookie。
 
 ### 源码运行
 
@@ -218,6 +234,8 @@ pnpm dev
 导入兼容 UTF-8 BOM。批量额度同步、Build 凭据续期、Web→Build/Console 转换、账号工具和账号清理均显示实时进度。
 
 Web 账号工具支持接受协议、设置对应 20–40 岁的随机生日和开启 NSFW；已完成步骤会记录并在后续执行时跳过。
+
+Playwright signer 的 SSO 只负责建立浏览器签名环境，不会自动导入网关账号池。建议在管理端导入同一会员账号的 Web SSO；更新 `.secrets/grok-sso-token` 后运行 `docker compose restart statsig-signer`。
 
 系统支持自动删除长期处于 `reauthRequired` 的账号，默认关闭；存在活动推理租约或视频任务的账号不会被删除。
 

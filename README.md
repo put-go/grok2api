@@ -153,6 +153,18 @@ cd grok2api
 cp config.example.yaml config.yaml
 ```
 
+Store the Grok member SSO used by the browser signer in a local Docker secret:
+
+```bash
+install -d -m 700 .secrets
+read -rsp "Grok SSO: " GROK_SSO_TOKEN && echo
+printf '%s' "$GROK_SSO_TOKEN" > .secrets/grok-sso-token
+chmod 600 .secrets/grok-sso-token
+unset GROK_SSO_TOKEN
+```
+
+The file must contain only the raw SSO token, without `sso=`, a cookie name, or other cookies. The directory is excluded from Git and the Docker build context.
+
 Generate secrets and place them in `config.yaml`:
 
 ```bash
@@ -173,12 +185,16 @@ bootstrapAdmin:
 Start the service:
 
 ```bash
-docker compose pull
-docker compose up -d
+docker compose up -d --build
 docker compose logs -f grok2api
+docker compose logs -f statsig-signer
 ```
 
 Open `http://127.0.0.1:8000`. The image already includes the frontend; SQLite data and local media are stored in the Compose volume.
+
+Compose builds a separate Playwright signer. It uses the member SSO to establish a real Grok browser session and invokes the current page code to generate a fresh `x-statsig-id` for every upstream request without exposing a host port. The gateway caches page verification metadata for one hour but does not cache request-bound signatures returned by this signer; the gateway waits for a healthy signer before starting.
+
+`GROK2API_STATSIG_SIGNER_URL` is a deployment-level override, so the local dynamic signer remains authoritative even when the database contains an older manual mode. Browser cookies are not exported to the Go gateway; if Cloudflare still rejects the gateway egress, configure a matching User-Agent and Cloudflare cookie under Egress Proxies.
 
 ### Run from source
 
@@ -217,6 +233,8 @@ After first sign-in, change the administrator password and remove `bootstrapAdmi
 Imports accept UTF-8 BOM. Bulk quota sync, Build credential renewal, Web→Build/Console conversion, account tools, and cleanup report live progress.
 
 Web account tools can accept the terms, set a random birthday corresponding to an age of 20–40, and enable NSFW. Completed steps are recorded and skipped on later runs.
+
+The Playwright signer's SSO only establishes its browser signing environment and is not imported into the gateway account pool. Import the same member account's Web SSO in the admin UI; after replacing `.secrets/grok-sso-token`, run `docker compose restart statsig-signer`.
 
 Automatic deletion of old `reauthRequired` accounts is available but disabled by default. Active inference leases and video jobs are protected.
 

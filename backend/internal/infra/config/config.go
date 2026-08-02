@@ -25,6 +25,7 @@ const (
 	ClearanceModeManual           = "manual"
 	ClearanceModeFlareSolverr     = "flaresolverr"
 	DefaultStatsigSignerURL       = "https://grok.wodf.de/sign"
+	statsigSignerURLEnv           = "GROK2API_STATSIG_SIGNER_URL"
 	DefaultFlareSolverrURL        = "http://flaresolverr:8191"
 	RecommendedBuildClientVersion = "0.2.111"
 	RecommendedBuildUserAgent     = "grok-shell/" + RecommendedBuildClientVersion + " (linux; x86_64)"
@@ -157,22 +158,37 @@ type BuildProviderConfig struct {
 const DefaultBuildFallbackBaseURL = "https://api.x.ai/v1"
 
 type WebProviderConfig struct {
-	BaseURL             string   `yaml:"baseURL"`
-	StatsigMode         string   `yaml:"-"`
-	StatsigManualValue  string   `yaml:"-"`
-	StatsigSignerURL    string   `yaml:"-"`
-	ClearanceMode       string   `yaml:"-"`
-	FlareSolverrURL     string   `yaml:"-"`
-	ClearanceTimeout    Duration `yaml:"-"`
-	ClearanceRefresh    Duration `yaml:"-"`
-	QuotaTimeout        Duration `yaml:"quotaTimeout"`
-	ChatTimeout         Duration `yaml:"chatTimeout"`
-	ImageTimeout        Duration `yaml:"imageTimeout"`
-	VideoTimeout        Duration `yaml:"videoTimeout"`
-	MediaConcurrency    int      `yaml:"mediaConcurrency"`
-	AllowNSFW           bool     `yaml:"allowNSFW"`
-	RecoveryBackoffBase Duration `yaml:"recoveryBackoffBase"`
-	RecoveryBackoffMax  Duration `yaml:"recoveryBackoffMax"`
+	BaseURL                  string   `yaml:"baseURL"`
+	StatsigMode              string   `yaml:"-"`
+	StatsigManualValue       string   `yaml:"-"`
+	StatsigSignerURL         string   `yaml:"-"`
+	StatsigSignerURLOverride string   `yaml:"-"`
+	ClearanceMode            string   `yaml:"-"`
+	FlareSolverrURL          string   `yaml:"-"`
+	ClearanceTimeout         Duration `yaml:"-"`
+	ClearanceRefresh         Duration `yaml:"-"`
+	QuotaTimeout             Duration `yaml:"quotaTimeout"`
+	ChatTimeout              Duration `yaml:"chatTimeout"`
+	ImageTimeout             Duration `yaml:"imageTimeout"`
+	VideoTimeout             Duration `yaml:"videoTimeout"`
+	MediaConcurrency         int      `yaml:"mediaConcurrency"`
+	AllowNSFW                bool     `yaml:"allowNSFW"`
+	RecoveryBackoffBase      Duration `yaml:"recoveryBackoffBase"`
+	RecoveryBackoffMax       Duration `yaml:"recoveryBackoffMax"`
+}
+
+func (c WebProviderConfig) EffectiveStatsigSignerURL() string {
+	if value := strings.TrimSpace(c.StatsigSignerURLOverride); value != "" {
+		return value
+	}
+	return strings.TrimSpace(c.StatsigSignerURL)
+}
+
+func (c WebProviderConfig) EffectiveStatsigMode() string {
+	if strings.TrimSpace(c.StatsigSignerURLOverride) != "" {
+		return StatsigModeURL
+	}
+	return strings.TrimSpace(c.StatsigMode)
 }
 
 type ConsoleProviderConfig struct {
@@ -311,6 +327,7 @@ func Load(path string) (Config, error) {
 			return Config{}, err
 		}
 	}
+	cfg.Provider.Web.StatsigSignerURLOverride = strings.TrimSpace(os.Getenv(statsigSignerURLEnv))
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
 	}
@@ -474,13 +491,13 @@ func (c Config) Validate() error {
 	if err != nil || webURL.Scheme != "https" || webURL.Host == "" || webURL.User != nil {
 		return errors.New("provider.web.baseURL 必须是无凭据的 HTTPS URL")
 	}
-	switch c.Provider.Web.StatsigMode {
+	switch c.Provider.Web.EffectiveStatsigMode() {
 	case StatsigModeManual:
 		if !validStatsigID(c.Provider.Web.StatsigManualValue) {
 			return errors.New("provider.web 手动 x-statsig-id 格式无效")
 		}
 	case StatsigModeURL:
-		if err := signerurl.Validate(c.Provider.Web.StatsigSignerURL); err != nil {
+		if err := signerurl.Validate(c.Provider.Web.EffectiveStatsigSignerURL()); err != nil {
 			return fmt.Errorf("provider.web Statsig 签名 URL 无效: %w", err)
 		}
 	default:
