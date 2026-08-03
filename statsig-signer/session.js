@@ -12,11 +12,11 @@ export function inferAccountTier(windows) {
     let candidate = "unknown";
     if (mode === "auto") {
       if (total === 7 || total === 20) candidate = "basic";
-      if (total === 50) candidate = "super";
+      if (total === 25 || total === 50) candidate = "super";
       if (total === 150) candidate = "heavy";
     } else if (mode === "fast") {
       if (total === 30) candidate = "basic";
-      if (total === 140) candidate = "super";
+      if (total === 70 || total === 140) candidate = "super";
       if (total === 400) candidate = "heavy";
     }
     if (

@@ -5,6 +5,7 @@ import { inferAccountTier, isLoginURL } from "./session.js";
 test("infers current Grok tiers from protected quota totals", () => {
   assert.equal(inferAccountTier([{ mode: "auto", total: 20 }, { mode: "fast", total: 30 }]), "basic");
   assert.equal(inferAccountTier([{ mode: "auto", total: 50 }, { mode: "fast", total: 140 }]), "super");
+  assert.equal(inferAccountTier([{ mode: "auto", total: 25 }, { mode: "fast", total: 70 }]), "super");
   assert.equal(inferAccountTier([{ mode: "auto", total: 150 }, { mode: "fast", total: 400 }]), "heavy");
 });
 
