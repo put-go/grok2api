@@ -200,6 +200,25 @@ func TestSegmentedActiveCohortOrderingMatchesFullPlannerHardOrder(t *testing.T) 
 	}
 }
 
+func TestSegmentedCandidateCohortsPoolSuperAndHeavy(t *testing.T) {
+	values := []account.RoutingCandidate{
+		{Credential: account.Credential{ID: 1, WebTier: account.WebTierSuper, Priority: 1}},
+		{Credential: account.Credential{ID: 2, WebTier: account.WebTierHeavy, Priority: 1}},
+		{Credential: account.Credential{ID: 3, WebTier: account.WebTierBasic, Priority: 1}},
+	}
+	groups := account.WebTierGroups{{account.WebTierBasic}, {account.WebTierSuper, account.WebTierHeavy}}
+	cohorts := segmentedCandidateCohorts(values, nil, time.Now().UTC(), groups, false)
+	if len(cohorts) != 2 {
+		t.Fatalf("cohort count = %d, want 2", len(cohorts))
+	}
+	if cohorts[0].cohort.tier != 0 || len(cohorts[0].indexes) != 1 || cohorts[0].indexes[0] != 2 {
+		t.Fatalf("Basic cohort = %#v", cohorts[0])
+	}
+	if cohorts[1].cohort.tier != 1 || len(cohorts[1].indexes) != 2 {
+		t.Fatalf("paid cohort = %#v", cohorts[1])
+	}
+}
+
 func TestSegmentedPlannerUsesOnePreferFreeBuildSnapshot(t *testing.T) {
 	now := time.Now().UTC()
 	values := []account.RoutingCandidate{

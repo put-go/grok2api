@@ -14,12 +14,15 @@ import (
 )
 
 var (
-	ErrAuthorizationPending = errors.New("authorization pending")
-	ErrSlowDown             = errors.New("authorization polling too fast")
-	ErrAuthorizationDenied  = errors.New("authorization denied")
-	ErrCredentialLimit      = errors.New("credential count exceeds limit")
-	ErrUnauthorized         = errors.New("upstream credential unauthorized")
-	ErrBirthDateAlreadySet  = errors.New("upstream birth date is already set")
+	ErrAuthorizationPending     = errors.New("authorization pending")
+	ErrSlowDown                 = errors.New("authorization polling too fast")
+	ErrAuthorizationDenied      = errors.New("authorization denied")
+	ErrCredentialLimit          = errors.New("credential count exceeds limit")
+	ErrUnauthorized             = errors.New("upstream credential unauthorized")
+	ErrBirthDateAlreadySet      = errors.New("upstream birth date is already set")
+	ErrAntiBotRejected          = errors.New("请求被上游机器人风控拦截，请稍后重试")
+	ErrContentPolicyViolation   = errors.New("视频生成被上游内容审核拦截")
+	ErrUpstreamStreamIncomplete = errors.New("上游响应流不完整")
 )
 
 // HTTPStatusError preserves the upstream status when a streaming or asynchronous Provider cannot return a Response.
@@ -418,7 +421,7 @@ type VideoContentDownloader interface {
 type RoutingMetadataAdapter interface {
 	Adapter
 	QuotaMode(upstreamModel string) string
-	TierOrder(upstreamModel string) []account.WebTier
+	TierGroups(upstreamModel string) account.WebTierGroups
 }
 
 // ModelAlias resolves a hidden compatibility model name to one public route and can fix reasoning effort.
@@ -760,7 +763,7 @@ func (r *Registry) QuotaMode(value account.Provider, upstreamModel string) strin
 	return metadata.QuotaMode(upstreamModel)
 }
 
-func (r *Registry) TierOrder(value account.Provider, upstreamModel string) []account.WebTier {
+func (r *Registry) TierGroups(value account.Provider, upstreamModel string) account.WebTierGroups {
 	adapter, ok := r.Get(value)
 	if !ok {
 		return nil
@@ -769,7 +772,7 @@ func (r *Registry) TierOrder(value account.Provider, upstreamModel string) []acc
 	if !ok {
 		return nil
 	}
-	return metadata.TierOrder(upstreamModel)
+	return metadata.TierGroups(upstreamModel)
 }
 
 func (r *Registry) PricingModel(value account.Provider, upstreamModel string) string {

@@ -1052,6 +1052,7 @@ func upsertKnownAccountByIdentity(tx *gorm.DB, value account.Credential, existin
 		row.Enabled = existing.Enabled
 		row.Priority = existing.Priority
 		row.MaxConcurrent = existing.MaxConcurrent
+		row.MaxConcurrentManaged = existing.MaxConcurrentManaged
 		row.MinimumRemaining = existing.MinimumRemaining
 		row.FailureCount = existing.FailureCount
 		row.CooldownUntil = existing.CooldownUntil
@@ -1090,7 +1091,8 @@ func upsertKnownAccountByIdentity(tx *gorm.DB, value account.Credential, existin
 		row.Priority = account.DefaultPriority
 	}
 	if row.MaxConcurrent == 0 {
-		row.MaxConcurrent = account.DefaultMaxConcurrent
+		row.MaxConcurrent = account.DefaultMaxConcurrentFor(value.Provider, value.WebTier)
+		row.MaxConcurrentManaged = true
 	}
 	row.Enabled = true
 	if err := tx.Create(&row).Error; err != nil {
@@ -1284,6 +1286,7 @@ func (r *AccountRepository) UpdateMany(ctx context.Context, providerValue accoun
 	}
 	if updates.MaxConcurrent != nil {
 		values["max_concurrent"] = *updates.MaxConcurrent
+		values["max_concurrent_managed"] = false
 	}
 	if updates.MinimumRemaining != nil {
 		values["minimum_remaining"] = *updates.MinimumRemaining
@@ -2069,6 +2072,15 @@ func (r *AccountRepository) ReplaceQuotaWindows(ctx context.Context, accountID u
 func (r *AccountRepository) saveQuotaWindows(ctx context.Context, accountID uint64, tier account.WebTier, syncedAt time.Time, values []account.QuotaWindow, replace bool) error {
 	return r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if tier != "" {
+			// Keep managed accounts aligned with the detected tier in both
+			// directions (including a paid-to-Basic downgrade). Explicitly
+			// configured concurrency is marked unmanaged and remains untouched.
+			desiredConcurrent := account.DefaultMaxConcurrentFor(account.ProviderWeb, tier)
+			if err := tx.Model(&accountModel{}).
+				Where("id = ? AND provider = ? AND max_concurrent_managed = ?", accountID, account.ProviderWeb, true).
+				Update("max_concurrent", desiredConcurrent).Error; err != nil {
+				return err
+			}
 			profile := webAccountProfileModel{AccountID: accountID, Tier: string(tier), SyncedAt: &syncedAt}
 			if err := tx.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "account_id"}}, DoUpdates: clause.AssignmentColumns([]string{"tier", "synced_at"})}).Create(&profile).Error; err != nil {
 				return err

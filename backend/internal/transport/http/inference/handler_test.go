@@ -18,6 +18,7 @@ import (
 	"github.com/chenyme/grok2api/backend/internal/application/gateway"
 	clientkeydomain "github.com/chenyme/grok2api/backend/internal/domain/clientkey"
 	mediadomain "github.com/chenyme/grok2api/backend/internal/domain/media"
+	"github.com/chenyme/grok2api/backend/internal/infra/provider"
 	"github.com/gin-gonic/gin"
 )
 
@@ -451,6 +452,21 @@ func TestVideoGenerationResponseMatchesOfficialPollingShape(t *testing.T) {
 	errorValue, ok := failed["error"].(gin.H)
 	if failed["status"] != "failed" || !ok || errorValue["code"] != "service_unavailable" || failed["model"] != nil || failed["progress"] != nil {
 		t.Fatalf("failed response=%#v", failed)
+	}
+	antiBot := videoGenerationResponse(mediadomain.Job{Status: mediadomain.StatusFailed, ErrorCode: "anti_bot_rejected", ErrorMessage: provider.ErrAntiBotRejected.Error()})
+	antiBotError, ok := antiBot["error"].(gin.H)
+	if !ok || antiBotError["code"] != "anti_bot_rejected" || antiBotError["message"] != provider.ErrAntiBotRejected.Error() {
+		t.Fatalf("anti-bot response=%#v", antiBot)
+	}
+	moderated := videoGenerationResponse(mediadomain.Job{Status: mediadomain.StatusFailed, ErrorCode: "content_policy_violation", ErrorMessage: "blocked"})
+	moderationError, ok := moderated["error"].(gin.H)
+	if !ok || moderationError["code"] != "content_policy_violation" {
+		t.Fatalf("moderated response=%#v", moderated)
+	}
+	incomplete := videoGenerationResponse(mediadomain.Job{Status: mediadomain.StatusFailed, ErrorCode: "upstream_stream_incomplete", ErrorMessage: "stream ended"})
+	incompleteError, ok := incomplete["error"].(gin.H)
+	if !ok || incompleteError["code"] != "upstream_stream_incomplete" {
+		t.Fatalf("incomplete response=%#v", incomplete)
 	}
 }
 

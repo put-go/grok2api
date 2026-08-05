@@ -110,18 +110,18 @@ func (a *Adapter) QuotaMode(upstreamModel string) string {
 	return ""
 }
 
-func (a *Adapter) TierOrder(upstreamModel string) []account.WebTier {
+func (a *Adapter) TierGroups(upstreamModel string) account.WebTierGroups {
 	spec, ok := Resolve(upstreamModel)
 	if !ok {
 		return nil
 	}
 	switch spec.MinimumTier {
 	case account.WebTierHeavy:
-		return []account.WebTier{account.WebTierHeavy}
+		return account.WebTierGroups{{account.WebTierHeavy}}
 	case account.WebTierSuper:
-		return []account.WebTier{account.WebTierSuper, account.WebTierHeavy}
+		return account.WebTierGroups{{account.WebTierSuper, account.WebTierHeavy}}
 	default:
-		return []account.WebTier{account.WebTierBasic, account.WebTierSuper, account.WebTierHeavy}
+		return account.WebTierGroups{{account.WebTierBasic}, {account.WebTierSuper, account.WebTierHeavy}}
 	}
 }
 

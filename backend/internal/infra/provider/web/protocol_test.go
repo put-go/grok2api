@@ -77,6 +77,18 @@ func TestParseMediaPostResponsePreservesStatusAndPostID(t *testing.T) {
 	}
 }
 
+func TestWebMediaUpstreamErrorClassifiesAntiBotRejection(t *testing.T) {
+	antiBot := newWebMediaUpstreamError(http.StatusForbidden, []byte(`{"error":{"code":7,"message":"Request rejected by anti-bot rules."}}`), false)
+	if !errors.Is(antiBot, provider.ErrAntiBotRejected) {
+		t.Fatalf("anti-bot error = %#v", antiBot)
+	}
+
+	generic := newWebMediaUpstreamError(http.StatusForbidden, []byte(`{"error":{"code":"forbidden","message":"access denied"}}`), false)
+	if errors.Is(generic, provider.ErrAntiBotRejected) {
+		t.Fatalf("generic forbidden misclassified as anti-bot: %#v", generic)
+	}
+}
+
 func TestPostJSONDoesNotReplayForbiddenMediaRequest(t *testing.T) {
 	var calls atomic.Int64
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
@@ -1046,21 +1058,23 @@ func TestWebMediaUpstreamDiagnosticLogsStageHeadersWithoutBodyPreview(t *testing
 	}
 }
 
-func TestChatModelsUseLowestSufficientTierFirst(t *testing.T) {
+func TestModelsUseExpectedTierGroups(t *testing.T) {
 	adapter := &Adapter{}
 	tests := []struct {
 		model string
-		want  []account.WebTier
+		want  account.WebTierGroups
 	}{
-		{model: "grok-chat-fast", want: []account.WebTier{account.WebTierBasic, account.WebTierSuper, account.WebTierHeavy}},
-		{model: "grok-chat-auto", want: []account.WebTier{account.WebTierSuper, account.WebTierHeavy}},
-		{model: "grok-chat-expert", want: []account.WebTier{account.WebTierSuper, account.WebTierHeavy}},
-		{model: "grok-chat-heavy", want: []account.WebTier{account.WebTierHeavy}},
+		{model: "grok-chat-fast", want: account.WebTierGroups{{account.WebTierBasic}, {account.WebTierSuper, account.WebTierHeavy}}},
+		{model: "grok-chat-auto", want: account.WebTierGroups{{account.WebTierSuper, account.WebTierHeavy}}},
+		{model: "grok-chat-expert", want: account.WebTierGroups{{account.WebTierSuper, account.WebTierHeavy}}},
+		{model: "grok-chat-heavy", want: account.WebTierGroups{{account.WebTierHeavy}}},
+		{model: "grok-imagine-video", want: account.WebTierGroups{{account.WebTierSuper, account.WebTierHeavy}}},
+		{model: "unknown", want: nil},
 	}
 	for _, test := range tests {
-		got := adapter.TierOrder(test.model)
-		if !slices.Equal(got, test.want) {
-			t.Fatalf("tier order for %s = %v, want %v", test.model, got, test.want)
+		got := adapter.TierGroups(test.model)
+		if !slices.EqualFunc(got, test.want, func(left, right []account.WebTier) bool { return slices.Equal(left, right) }) {
+			t.Fatalf("tier groups for %s = %v, want %v", test.model, got, test.want)
 		}
 	}
 }
@@ -1463,6 +1477,170 @@ func TestParseVideoStreamUsesModelResponseAttachment(t *testing.T) {
 	}
 	if postID != "post_1" || result.URL != "https://assets.grok.com/users/user_1/generated/video_1/generated_video.mp4" || result.ContentType != "video/mp4" {
 		t.Fatalf("result = %#v, post = %q", result, postID)
+	}
+}
+
+func TestParseVideoCapturedSingleReferenceResponse(t *testing.T) {
+	fixture := `{"result":{"conversation":{"conversationId":"conversation_1"}}}` +
+		`{"result":{"response":{"streamingVideoGenerationResponse":{"videoId":"video_1","progress":95,"imageReference":"https://assets.grok.com/users/user_1/reference_1/content","moderated":false,"videoPostId":"video_1"}}}}` +
+		`{"result":{"response":{"streamingVideoGenerationResponse":{"videoId":"video_1","progress":100,"assetId":"video_1","videoUrl":"users/user_1/generated/video_1/generated_video.mp4","imageReference":"https://assets.grok.com/users/user_1/reference_1/content","moderated":false,"videoPostId":"video_1"}}}}` +
+		`{"result":{"response":{"token":"I generated a video","isSoftStop":true}}}`
+	response := &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(fixture))}
+	outcome, err := parseVideoStreamDetailed(response, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, reconstructed, err := outcome.finalResult("")
+	if err != nil || reconstructed || !outcome.completed || outcome.lastProgress != 100 || outcome.videoID != "video_1" || outcome.userID != "user_1" {
+		t.Fatalf("outcome=%#v reconstructed=%t err=%v", outcome, reconstructed, err)
+	}
+	if result.URL != "https://assets.grok.com/users/user_1/generated/video_1/generated_video.mp4" || result.ContentType != "video/mp4" {
+		t.Fatalf("result=%#v", result)
+	}
+}
+
+func TestVideoStreamReconstructsCompletedAssetURL(t *testing.T) {
+	fixture := `{"result":{"response":{"streamingVideoGenerationResponse":{"videoId":"video_1","progress":100,"assetId":"video_1","imageReference":"https://assets.grok.com/users/user_1/reference_1/content","moderated":false}}}}`
+	response := &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(fixture))}
+	outcome, err := parseVideoStreamDetailed(response, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, reconstructed, err := outcome.finalResult("")
+	if err != nil || !reconstructed || result.URL != "https://assets.grok.com/users/user_1/generated/video_1/generated_video.mp4" || result.ContentType != "video/mp4" {
+		t.Fatalf("result=%#v reconstructed=%t err=%v outcome=%#v", result, reconstructed, err, outcome)
+	}
+}
+
+func TestVideoStreamPrefersVerifiedResponseUserForReconstruction(t *testing.T) {
+	outcome := videoStreamOutcome{videoID: "video_1", userID: "response_user", lastProgress: 100, completed: true}
+	result, reconstructed, err := outcome.finalResult("stale_credential_user")
+	if err != nil || !reconstructed || result.URL != "https://assets.grok.com/users/response_user/generated/video_1/generated_video.mp4" {
+		t.Fatalf("result=%#v reconstructed=%t err=%v", result, reconstructed, err)
+	}
+}
+
+func TestVideoStreamRejectsPrematureEOFWithoutReconstruction(t *testing.T) {
+	fixture := `{"result":{"response":{"streamingVideoGenerationResponse":{"videoId":"video_1","progress":95,"imageReference":"https://assets.grok.com/users/user_1/reference_1/content","moderated":false}}}}`
+	response := &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(fixture))}
+	outcome, err := parseVideoStreamDetailed(response, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, reconstructed, err := outcome.finalResult("")
+	var incomplete *webVideoIncompleteError
+	if reconstructed || !errors.As(err, &incomplete) || incomplete.HTTPStatusCode() != http.StatusBadGateway || incomplete.lastProgress != 95 {
+		t.Fatalf("reconstructed=%t err=%#v outcome=%#v", reconstructed, err, outcome)
+	}
+}
+
+func TestVideoStreamClassifiesTruncatedJSONAsIncomplete(t *testing.T) {
+	fixture := `{"result":{"response":{"streamingVideoGenerationResponse":{"progress":95}}`
+	response := &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(fixture))}
+	_, err := parseVideoStreamDetailed(response, nil)
+	if !errors.Is(err, provider.ErrUpstreamStreamIncomplete) {
+		t.Fatalf("error=%v", err)
+	}
+}
+
+func TestVideoStreamClassifiesTruncatedSSEAfterURLAsIncomplete(t *testing.T) {
+	fixture := `data: {"result":{"response":{"streamingVideoGenerationResponse":{"progress":100,"videoUrl":"users/user_1/generated/video_1/generated_video.mp4"}}}}` + "\n" +
+		`data: {"result":{"streamingVideoGenerationResponse":{"progress":100,"moderated":true}`
+	response := &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(fixture))}
+	_, err := parseVideoStreamDetailed(response, nil)
+	if !errors.Is(err, provider.ErrUpstreamStreamIncomplete) {
+		t.Fatalf("error=%v", err)
+	}
+}
+
+func TestVideoStreamDoesNotReconstructModeratedResult(t *testing.T) {
+	fixture := `{"result":{"response":{"streamingVideoGenerationResponse":{"videoId":"video_1","progress":100,"imageReference":"https://assets.grok.com/users/user_1/reference_1/content","moderated":true}}}}`
+	response := &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(fixture))}
+	outcome, err := parseVideoStreamDetailed(response, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, reconstructed, err := outcome.finalResult("")
+	if reconstructed || err == nil || !strings.Contains(err.Error(), "审核") {
+		t.Fatalf("reconstructed=%t err=%v outcome=%#v", reconstructed, err, outcome)
+	}
+}
+
+func TestVideoStreamLateModerationOverridesCompletedURL(t *testing.T) {
+	fixture := `{"result":{"response":{"streamingVideoGenerationResponse":{"videoId":"video_1","progress":100,"videoUrl":"users/user_1/generated/video_1/generated_video.mp4","moderated":false}}}}` +
+		`{"result":{"streamingVideoGenerationResponse":{"videoId":"video_1","progress":100,"moderated":true}}}`
+	response := &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(fixture))}
+	outcome, err := parseVideoStreamDetailed(response, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, reconstructed, resultErr := outcome.finalResult("")
+	if reconstructed || !outcome.moderated || !errors.Is(resultErr, provider.ErrContentPolicyViolation) {
+		t.Fatalf("outcome=%#v reconstructed=%t error=%v", outcome, reconstructed, resultErr)
+	}
+}
+
+func TestVideoStreamSupportsDirectResultWrapper(t *testing.T) {
+	tests := []struct {
+		name          string
+		fixture       string
+		wantURL       string
+		wantModerated bool
+		wantError     string
+	}{
+		{
+			name:    "completed URL",
+			fixture: `{"result":{"streamingVideoGenerationResponse":{"videoId":"video_1","progress":100,"videoUrl":"users/user_1/generated/video_1/generated_video.mp4","moderated":false}}}`,
+			wantURL: "https://assets.grok.com/users/user_1/generated/video_1/generated_video.mp4",
+		},
+		{
+			name:          "moderated",
+			fixture:       `{"result":{"streamingVideoGenerationResponse":{"videoId":"video_1","progress":100,"moderated":true}}}`,
+			wantModerated: true,
+		},
+		{
+			name:    "completed ID for reconstruction",
+			fixture: `{"result":{"streamingVideoGenerationResponse":{"videoId":"video_1","progress":100,"imageReference":"https://assets.grok.com/users/user_1/reference_1/content","moderated":false}}}`,
+			wantURL: "https://assets.grok.com/users/user_1/generated/video_1/generated_video.mp4",
+		},
+		{
+			name:      "stream error",
+			fixture:   `{"result":{"error":{"code":"video_failed","message":"generation failed"}}}`,
+			wantError: "video_failed",
+		},
+		{
+			name:    "model response attachment",
+			fixture: `{"result":{"modelResponse":{"fileAttachments":["users/user_1/generated/video_1/generated_video.mp4"]}}}`,
+			wantURL: "https://assets.grok.com/users/user_1/generated/video_1/generated_video.mp4",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			response := &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(test.fixture))}
+			outcome, err := parseVideoStreamDetailed(response, nil)
+			if test.wantError != "" {
+				if err == nil || !strings.Contains(err.Error(), test.wantError) {
+					t.Fatalf("error=%v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if outcome.responseShape != "result" {
+				t.Fatalf("response shape=%q", outcome.responseShape)
+			}
+			result, _, resultErr := outcome.finalResult("")
+			if test.wantModerated {
+				if !errors.Is(resultErr, provider.ErrContentPolicyViolation) || !outcome.moderated {
+					t.Fatalf("outcome=%#v error=%v", outcome, resultErr)
+				}
+				return
+			}
+			if resultErr != nil || result.URL != test.wantURL {
+				t.Fatalf("result=%#v outcome=%#v error=%v", result, outcome, resultErr)
+			}
+		})
 	}
 }
 

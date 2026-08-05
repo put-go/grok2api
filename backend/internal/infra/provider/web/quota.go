@@ -96,7 +96,7 @@ func inferWebTierFromQuota(windows []account.QuotaWindow) (account.WebTier, bool
 			switch window.Total {
 			case 7, 20:
 				candidate = account.WebTierBasic
-			case 50:
+			case 25, 50:
 				candidate = account.WebTierSuper
 			case 150:
 				candidate = account.WebTierHeavy
@@ -105,7 +105,7 @@ func inferWebTierFromQuota(windows []account.QuotaWindow) (account.WebTier, bool
 			switch window.Total {
 			case 30:
 				candidate = account.WebTierBasic
-			case 140:
+			case 70, 140:
 				candidate = account.WebTierSuper
 			case 400:
 				candidate = account.WebTierHeavy

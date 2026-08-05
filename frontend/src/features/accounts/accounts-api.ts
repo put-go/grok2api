@@ -120,7 +120,7 @@ export type AccountUpdateInput = {
   name: string;
   enabled: boolean;
   priority: number;
-  maxConcurrent: number;
+  maxConcurrent?: number;
   minimumRemaining: number;
   cloudflareCookies?: string;
   clearCloudflareCookies?: boolean;

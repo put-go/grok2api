@@ -284,6 +284,7 @@ func TestInferWebTierFromUpstreamQuota(t *testing.T) {
 		{name: "current basic", windows: []account.QuotaWindow{{Mode: "auto", Total: 7}, {Mode: "fast", Total: 30}}, want: account.WebTierBasic, known: true},
 		{name: "legacy basic", windows: []account.QuotaWindow{{Mode: "auto", Total: 20}}, want: account.WebTierBasic, known: true},
 		{name: "super", windows: []account.QuotaWindow{{Mode: "auto", Total: 50}, {Mode: "fast", Total: 140}}, want: account.WebTierSuper, known: true},
+		{name: "new super quota", windows: []account.QuotaWindow{{Mode: "auto", Total: 25}, {Mode: "fast", Total: 70}}, want: account.WebTierSuper, known: true},
 		{name: "heavy", windows: []account.QuotaWindow{{Mode: "auto", Total: 150}, {Mode: "fast", Total: 400}}, want: account.WebTierHeavy, known: true},
 		{name: "heavy mode", windows: []account.QuotaWindow{{Mode: "heavy", Total: 20}}, want: account.WebTierHeavy, known: true},
 		{name: "conflicting signal uses lower tier", windows: []account.QuotaWindow{{Mode: "auto", Total: 50}, {Mode: "fast", Total: 30}}, want: account.WebTierBasic, known: true},

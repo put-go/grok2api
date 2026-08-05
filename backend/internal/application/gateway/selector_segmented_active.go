@@ -41,7 +41,7 @@ func (s *Selector) nextSegmentedActiveRequest(provider account.Provider, upstrea
 	return &segmentedSelectorActiveRequest{provider: provider, windowSize: config.windowSize, cursor: cursor}
 }
 
-func (s *Selector) acquireSegmentedCandidates(ctx context.Context, values []account.RoutingCandidate, indexes []int, quotaMode string, tierOrder []account.WebTier, request segmentedSelectorActiveRequest) (*accountLease, error) {
+func (s *Selector) acquireSegmentedCandidates(ctx context.Context, values []account.RoutingCandidate, indexes []int, quotaMode string, tierGroups account.WebTierGroups, request segmentedSelectorActiveRequest) (*accountLease, error) {
 	startedAt := time.Now()
 	_, _, _, capacityWait := s.routingConfig()
 	waitDeadline := time.Now().Add(capacityWait)
@@ -57,7 +57,7 @@ func (s *Selector) acquireSegmentedCandidates(ctx context.Context, values []acco
 				length = len(values)
 			}
 			candidatesScanned += length
-			plan, err := s.planCandidateIndexesWithHints(ctx, values, indexes, now, tierOrder, nil, preferFreeBuild)
+			plan, err := s.planCandidateIndexesWithHints(ctx, values, indexes, now, tierGroups, nil, preferFreeBuild)
 			if err != nil {
 				observeSegmentedActive(request.provider, "error", "full_fallback", startedAt, windowsScanned, candidatesScanned)
 				return nil, err
@@ -77,7 +77,7 @@ func (s *Selector) acquireSegmentedCandidates(ctx context.Context, values []acco
 			}
 		} else {
 			concurrencyHints := make([]int, len(values))
-			cohorts := segmentedCandidateCohorts(values, indexes, now, tierOrder, preferFreeBuild)
+			cohorts := segmentedCandidateCohorts(values, indexes, now, tierGroups, preferFreeBuild)
 			roundWindows := 0
 			fallbackToFull := false
 			for cohortIndex, bucket := range cohorts {
@@ -86,7 +86,7 @@ func (s *Selector) acquireSegmentedCandidates(ctx context.Context, values []acco
 					windowsScanned++
 					roundWindows++
 					candidatesScanned += len(windowIndexes)
-					plan, err := s.planCandidateIndexesWithHints(ctx, values, windowIndexes, now, tierOrder, concurrencyHints, preferFreeBuild)
+					plan, err := s.planCandidateIndexesWithHints(ctx, values, windowIndexes, now, tierGroups, concurrencyHints, preferFreeBuild)
 					if err != nil {
 						observeSegmentedActive(request.provider, "error", "planning", startedAt, windowsScanned, candidatesScanned)
 						return nil, err
@@ -116,7 +116,7 @@ func (s *Selector) acquireSegmentedCandidates(ctx context.Context, values []acco
 					length = len(values)
 				}
 				candidatesScanned += length
-				plan, err := s.planCandidateIndexesWithHints(ctx, values, indexes, now, tierOrder, concurrencyHints, preferFreeBuild)
+				plan, err := s.planCandidateIndexesWithHints(ctx, values, indexes, now, tierGroups, concurrencyHints, preferFreeBuild)
 				if err != nil {
 					observeSegmentedActive(request.provider, "error", "full_fallback", startedAt, windowsScanned, candidatesScanned)
 					return nil, err
@@ -177,14 +177,15 @@ func (s *Selector) claimSegmentedPlan(ctx context.Context, plan *candidatePlan, 
 	return result, nil
 }
 
-func segmentedCandidateCohorts(values []account.RoutingCandidate, indexes []int, now time.Time, tierOrder []account.WebTier, preferFreeBuild bool) []segmentedSelectorCohortBucket {
+func segmentedCandidateCohorts(values []account.RoutingCandidate, indexes []int, now time.Time, tierGroups account.WebTierGroups, preferFreeBuild bool) []segmentedSelectorCohortBucket {
 	buckets := make(map[segmentedSelectorCohort][]int)
 	appendCandidate := func(index int) {
 		candidate := values[index]
+		tierRank, _ := tierGroups.Rank(candidate.Credential.WebTier)
 		cohort := segmentedSelectorCohort{
 			supportsModel: candidate.SupportsModel, capabilityKnown: candidate.ModelCapabilityKnown,
 			preferFreeBuild: preferFreeBuild && candidate.IsKnownFreeBuild(),
-			tier:            tierOrderRank(tierOrder, candidate.Credential.WebTier), priority: candidate.Credential.Priority,
+			tier:            tierRank, priority: candidate.Credential.Priority,
 		}
 		if candidate.Billing != nil {
 			cohort.billingFresh = now.Sub(candidate.Billing.SyncedAt) <= 30*time.Minute

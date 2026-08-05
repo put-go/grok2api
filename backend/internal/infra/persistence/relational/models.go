@@ -36,16 +36,17 @@ type accountModel struct {
 	Enabled     bool   `gorm:"not null"`
 	AuthStatus  string `gorm:"size:32;not null;check:chk_accounts_auth_status,auth_status IN ('active','reauthRequired')"`
 	// ReauthMarkedAt 进入 reauthRequired 的时刻；active 时为 NULL。
-	ReauthMarkedAt   *time.Time
-	Priority         int     `gorm:"not null;default:1"`
-	MaxConcurrent    int     `gorm:"not null;default:8;check:chk_accounts_max_concurrent,max_concurrent BETWEEN 1 AND 256"`
-	MinimumRemaining float64 `gorm:"not null;check:chk_accounts_minimum_remaining,minimum_remaining >= 0"`
-	FailureCount     int     `gorm:"not null;check:chk_accounts_failure_count,failure_count >= 0"`
-	CooldownUntil    *time.Time
-	LastError        string `gorm:"size:512;check:chk_accounts_last_error,length(last_error) <= 512"`
-	LastUsedAt       *time.Time
-	ObservedModel    string `gorm:"size:255;check:chk_accounts_observed_model,length(observed_model) <= 255"`
-	ObservedModelAt  *time.Time
+	ReauthMarkedAt       *time.Time
+	Priority             int     `gorm:"not null;default:1"`
+	MaxConcurrent        int     `gorm:"not null;default:8;check:chk_accounts_max_concurrent,max_concurrent BETWEEN 1 AND 256"`
+	MaxConcurrentManaged bool    `gorm:"not null;default:false"`
+	MinimumRemaining     float64 `gorm:"not null;check:chk_accounts_minimum_remaining,minimum_remaining >= 0"`
+	FailureCount         int     `gorm:"not null;check:chk_accounts_failure_count,failure_count >= 0"`
+	CooldownUntil        *time.Time
+	LastError            string `gorm:"size:512;check:chk_accounts_last_error,length(last_error) <= 512"`
+	LastUsedAt           *time.Time
+	ObservedModel        string `gorm:"size:255;check:chk_accounts_observed_model,length(observed_model) <= 255"`
+	ObservedModelAt      *time.Time
 	// BuildAPIFallback 仅对 grok_build 有意义：XAI 推理回退标记；其他 Provider 保持 false。
 	BuildAPIFallback bool `gorm:"not null;default:false"`
 	// BuildRouteMode 仅控制 grok_build 推理地址；其它 Provider 固定 auto。

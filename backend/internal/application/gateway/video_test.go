@@ -85,6 +85,24 @@ func TestRecoverVideoJobsRecordsFailedAuditWithEgress(t *testing.T) {
 	}
 }
 
+func TestRecoverVideoJobsRecordsModerationAuditAsBadRequest(t *testing.T) {
+	completedAt := time.Now().UTC()
+	repository := &videoUsageRepository{job: media.Job{
+		ID: "video_moderated_recovery", RequestID: "request-moderated-recovery",
+		Provider: "grok_web", Model: "grok-imagine-video", UpstreamModel: "video",
+		Status: media.StatusFailed, ErrorCode: "content_policy_violation", ErrorMessage: provider.ErrContentPolicyViolation.Error(),
+		CreatedAt: completedAt.Add(-time.Minute), CompletedAt: &completedAt,
+	}}
+	recorder := &durableVideoAuditRecorder{}
+	service := &Service{mediaJobs: repository, audits: recorder}
+	if err := service.RecoverVideoJobs(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if recorder.calls != 1 || recorder.last.StatusCode != http.StatusBadRequest || recorder.last.ErrorCode != "content_policy_violation" {
+		t.Fatalf("audit = %#v, calls = %d", recorder.last, recorder.calls)
+	}
+}
+
 func TestRecoverVideoJobsRecordsDetachedAccountSnapshot(t *testing.T) {
 	completedAt := time.Now().UTC()
 	repository := &videoUsageRepository{job: media.Job{
@@ -139,6 +157,33 @@ type videoStatusError struct {
 
 func (e videoStatusError) Error() string       { return e.message }
 func (e videoStatusError) HTTPStatusCode() int { return e.status }
+
+func TestClassifyVideoJobError(t *testing.T) {
+	tests := []struct {
+		name              string
+		err               error
+		wantCode          string
+		wantMessage       string
+		wantRequestScoped bool
+	}{
+		{name: "anti bot", err: fmt.Errorf("upstream detail: %w", provider.ErrAntiBotRejected), wantCode: "anti_bot_rejected", wantMessage: provider.ErrAntiBotRejected.Error()},
+		{name: "moderation", err: provider.ErrContentPolicyViolation, wantCode: "content_policy_violation", wantRequestScoped: true},
+		{name: "incomplete stream", err: fmt.Errorf("read failed: %w", provider.ErrUpstreamStreamIncomplete), wantCode: "upstream_stream_incomplete"},
+		{name: "forbidden", err: videoStatusError{status: http.StatusForbidden, message: "forbidden"}, wantCode: "provider_unavailable"},
+		{name: "generic", err: errors.New("generation failed"), wantCode: "generation_failed"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			code, publicErr := classifyVideoJobError(test.err)
+			if code != test.wantCode || isVideoRequestScopedFailure(test.err) != test.wantRequestScoped {
+				t.Fatalf("code=%q request_scoped=%t", code, isVideoRequestScopedFailure(test.err))
+			}
+			if test.wantMessage != "" && publicErr.Error() != test.wantMessage {
+				t.Fatalf("message=%q want=%q", publicErr.Error(), test.wantMessage)
+			}
+		})
+	}
+}
 
 func TestVideoQueueIsBoundedAndDeduplicated(t *testing.T) {
 	service := &Service{}
