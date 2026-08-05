@@ -243,19 +243,19 @@ type Selector struct {
 	overlayProviderVersion map[account.Provider]uint64
 	candidateLoads         singleflight.Group
 	concurrencySnapshots   *resultcache.Cache[[32]byte, map[string]int]
-	tierOrders             interface {
-		TierOrder(account.Provider, string) []account.WebTier
+	tierGroups             interface {
+		TierGroups(account.Provider, string) account.WebTierGroups
 	}
 }
 
-func NewSelector(accounts repository.AccountRepository, concurrency repository.ConcurrencyLimiter, sticky repository.StickySessionRepository, tierOrders interface {
-	TierOrder(account.Provider, string) []account.WebTier
+func NewSelector(accounts repository.AccountRepository, concurrency repository.ConcurrencyLimiter, sticky repository.StickySessionRepository, tierGroups interface {
+	TierGroups(account.Provider, string) account.WebTierGroups
 }, stickyTTL, cooldownBase, cooldownMax time.Duration, capacityWait ...time.Duration) *Selector {
 	wait := time.Duration(0)
 	if len(capacityWait) > 0 && capacityWait[0] > 0 {
 		wait = capacityWait[0]
 	}
-	return &Selector{accounts: accounts, concurrency: concurrency, sticky: sticky, tierOrders: tierOrders, stickyTTL: stickyTTL, cooldownBase: cooldownBase, cooldownMax: cooldownMax, capacityWait: wait, leaseWake: make(chan struct{}), lastSelectedAt: make(map[uint64]time.Time), lastSuccessAt: make(map[uint64]time.Time), candidates: make(map[candidateCacheKey]candidateSnapshot), routingBases: make(map[routingBaseCacheKey]routingBaseSnapshot), routingOverlays: make(map[routingOverlayCacheKey]routingOverlaySnapshot), routingAccountProvider: make(map[uint64]account.Provider), baseProviderVersion: make(map[account.Provider]uint64), overlayProviderVersion: make(map[account.Provider]uint64), concurrencySnapshots: resultcache.New[[32]byte, map[string]int](maxConcurrencySnapshots, concurrencySnapshotTTL)}
+	return &Selector{accounts: accounts, concurrency: concurrency, sticky: sticky, tierGroups: tierGroups, stickyTTL: stickyTTL, cooldownBase: cooldownBase, cooldownMax: cooldownMax, capacityWait: wait, leaseWake: make(chan struct{}), lastSelectedAt: make(map[uint64]time.Time), lastSuccessAt: make(map[uint64]time.Time), candidates: make(map[candidateCacheKey]candidateSnapshot), routingBases: make(map[routingBaseCacheKey]routingBaseSnapshot), routingOverlays: make(map[routingOverlayCacheKey]routingOverlaySnapshot), routingAccountProvider: make(map[uint64]account.Provider), baseProviderVersion: make(map[account.Provider]uint64), overlayProviderVersion: make(map[account.Provider]uint64), concurrencySnapshots: resultcache.New[[32]byte, map[string]int](maxConcurrencySnapshots, concurrencySnapshotTTL)}
 }
 
 func (s *Selector) UpdateConfig(stickyTTL, cooldownBase, cooldownMax time.Duration, capacityWait ...time.Duration) {
@@ -317,6 +317,7 @@ func (s *Selector) acquire(ctx context.Context, provider account.Provider, model
 	if err != nil {
 		return nil, err
 	}
+	tierGroups := s.resolveTierGroups(provider, upstreamModel)
 	// 仅保留候选下标，避免每个请求复制包含凭据、计费和额度结构的完整账号切片。
 	normalCandidates := make([]int, 0, len(values))
 	probeCandidates := make([]int, 0, len(values))
@@ -335,6 +336,9 @@ func (s *Selector) acquire(ctx context.Context, provider account.Provider, model
 			continue
 		}
 		consideredCandidates++
+		if _, allowed := tierGroups.Rank(value.WebTier); !allowed {
+			continue
+		}
 		if candidate.ModelCapabilityKnown && !candidate.SupportsModel {
 			continue
 		}
@@ -391,7 +395,7 @@ func (s *Selector) acquire(ctx context.Context, provider account.Provider, model
 	if len(probeCandidates) > 0 {
 		staleClaims := 0
 		capacityMisses := 0
-		plan, err := s.planCandidateIndexes(ctx, values, probeCandidates, now, s.resolveTierOrder(provider, upstreamModel))
+		plan, err := s.planCandidateIndexes(ctx, values, probeCandidates, now, tierGroups)
 		if err != nil {
 			return nil, err
 		}
@@ -464,7 +468,7 @@ func (s *Selector) acquire(ctx context.Context, provider account.Provider, model
 	// 粘性账号仅因并发满载而暂时不可用时，先等待该账号；超时后允许本次请求临时借用
 	// 其他账号，但不覆盖原绑定，避免并行请求让活跃会话在账号池中来回抖动。
 	if saturatedStickyID != 0 {
-		plan, err := s.planCandidateIndexes(ctx, values, normalCandidates, time.Now().UTC(), s.resolveTierOrder(provider, upstreamModel))
+		plan, err := s.planCandidateIndexes(ctx, values, normalCandidates, time.Now().UTC(), tierGroups)
 		if err != nil {
 			return nil, err
 		}
@@ -491,7 +495,7 @@ func (s *Selector) acquire(ctx context.Context, provider account.Provider, model
 	if stickyKey == "" {
 		activeRequest := s.nextSegmentedActiveRequest(provider, upstreamModel, quotaMode, len(normalCandidates))
 		if activeRequest != nil {
-			return s.acquireSegmentedCandidates(ctx, values, normalCandidates, quotaMode, s.resolveTierOrder(provider, upstreamModel), *activeRequest)
+			return s.acquireSegmentedCandidates(ctx, values, normalCandidates, quotaMode, tierGroups, *activeRequest)
 		}
 	}
 	_, _, _, capacityWait := s.routingConfig()
@@ -500,7 +504,7 @@ func (s *Selector) acquire(ctx context.Context, provider account.Provider, model
 		currentTime := time.Now().UTC()
 		staleClaims := 0
 		capacityMisses := 0
-		plan, err := s.planCandidateIndexes(ctx, values, normalCandidates, currentTime, s.resolveTierOrder(provider, upstreamModel))
+		plan, err := s.planCandidateIndexes(ctx, values, normalCandidates, currentTime, tierGroups)
 		if err != nil {
 			return nil, err
 		}
@@ -614,6 +618,7 @@ func (s *Selector) acquirePinned(ctx context.Context, provider account.Provider,
 	if err != nil {
 		return nil, err
 	}
+	tierGroups := s.resolveTierGroups(provider, upstreamModel)
 	for _, candidate := range values {
 		value := candidate.Credential
 		if value.ID != accountID {
@@ -626,6 +631,9 @@ func (s *Selector) acquirePinned(ctx context.Context, provider account.Provider,
 			return nil, &SelectionUnavailableError{Reason: SelectionNoAccounts}
 		}
 		if inference {
+			if _, allowed := tierGroups.Rank(value.WebTier); !allowed {
+				return nil, &SelectionUnavailableError{Reason: SelectionUnsupportedModel}
+			}
 			if candidate.ModelCapabilityKnown && !candidate.SupportsModel {
 				return nil, &SelectionUnavailableError{Reason: SelectionUnsupportedModel}
 			}
@@ -1359,18 +1367,9 @@ func retryDelay(now, retryAt time.Time) time.Duration {
 	return retryAt.Sub(now)
 }
 
-func (s *Selector) resolveTierOrder(provider account.Provider, upstreamModel string) []account.WebTier {
-	if s.tierOrders == nil {
+func (s *Selector) resolveTierGroups(provider account.Provider, upstreamModel string) account.WebTierGroups {
+	if s.tierGroups == nil {
 		return nil
 	}
-	return s.tierOrders.TierOrder(provider, upstreamModel)
-}
-
-func tierOrderRank(order []account.WebTier, tier account.WebTier) int {
-	for index, value := range order {
-		if value == tier {
-			return index
-		}
-	}
-	return len(order)
+	return s.tierGroups.TierGroups(provider, upstreamModel)
 }

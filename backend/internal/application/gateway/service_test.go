@@ -1139,8 +1139,8 @@ func (finalizationOrderAdapter) Definition() provider.Definition {
 	}
 }
 func (finalizationOrderAdapter) QuotaMode(string) string { return "fast" }
-func (finalizationOrderAdapter) TierOrder(string) []account.WebTier {
-	return []account.WebTier{account.WebTierBasic, account.WebTierSuper, account.WebTierHeavy}
+func (finalizationOrderAdapter) TierGroups(string) account.WebTierGroups {
+	return account.WebTierGroups{{account.WebTierBasic}, {account.WebTierSuper, account.WebTierHeavy}}
 }
 func (finalizationOrderAdapter) ForwardResponse(context.Context, provider.ResponseResourceRequest) (*provider.Response, error) {
 	return &provider.Response{StatusCode: http.StatusOK, Status: "200 OK", Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"id":"resp-finalization-order"}`)), QuotaUnits: 1}, nil
@@ -3100,8 +3100,8 @@ func (webRateLimitAdapter) Definition() provider.Definition {
 	return testConversationDefinition(account.ProviderWeb)
 }
 func (webRateLimitAdapter) QuotaMode(string) string { return "fast" }
-func (webRateLimitAdapter) TierOrder(string) []account.WebTier {
-	return []account.WebTier{account.WebTierBasic, account.WebTierSuper, account.WebTierHeavy}
+func (webRateLimitAdapter) TierGroups(string) account.WebTierGroups {
+	return account.WebTierGroups{{account.WebTierBasic}, {account.WebTierSuper, account.WebTierHeavy}}
 }
 func (webRateLimitAdapter) ForwardResponse(context.Context, provider.ResponseResourceRequest) (*provider.Response, error) {
 	header := make(http.Header)
@@ -3119,8 +3119,8 @@ func (a *webImageStreamAdapter) QuotaMode(model string) string {
 	}
 	return ""
 }
-func (a *webImageStreamAdapter) TierOrder(string) []account.WebTier {
-	return []account.WebTier{account.WebTierSuper, account.WebTierHeavy}
+func (a *webImageStreamAdapter) TierGroups(string) account.WebTierGroups {
+	return account.WebTierGroups{{account.WebTierSuper, account.WebTierHeavy}}
 }
 func (a *webImageStreamAdapter) GenerateImage(ctx context.Context, request provider.ImageGenerationRequest) (*provider.Response, error) {
 	a.mu.Lock()
@@ -3214,8 +3214,8 @@ func (a *webChatQuotaAdapter) Definition() provider.Definition {
 	return testConversationDefinition(account.ProviderWeb)
 }
 func (a *webChatQuotaAdapter) QuotaMode(string) string { return "fast" }
-func (a *webChatQuotaAdapter) TierOrder(string) []account.WebTier {
-	return []account.WebTier{account.WebTierBasic, account.WebTierSuper, account.WebTierHeavy}
+func (a *webChatQuotaAdapter) TierGroups(string) account.WebTierGroups {
+	return account.WebTierGroups{{account.WebTierBasic}, {account.WebTierSuper, account.WebTierHeavy}}
 }
 func (a *webChatQuotaAdapter) ForwardResponse(context.Context, provider.ResponseResourceRequest) (*provider.Response, error) {
 	return &provider.Response{StatusCode: http.StatusOK, Status: "200 OK", Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"id":"chat-response"}`))}, nil

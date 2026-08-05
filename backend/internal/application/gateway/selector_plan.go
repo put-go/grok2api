@@ -90,17 +90,17 @@ func candidateScoreBetter(values []account.RoutingCandidate, leftScore, rightSco
 }
 
 // planCandidates 批量读取动态并发状态，并以 O(n) 建堆生成保持原比较规则的候选计划。
-func (s *Selector) planCandidates(ctx context.Context, values []account.RoutingCandidate, now time.Time, tierOrder []account.WebTier) (*candidatePlan, error) {
-	return s.planCandidateIndexes(ctx, values, nil, now, tierOrder)
+func (s *Selector) planCandidates(ctx context.Context, values []account.RoutingCandidate, now time.Time, tierGroups account.WebTierGroups) (*candidatePlan, error) {
+	return s.planCandidateIndexes(ctx, values, nil, now, tierGroups)
 }
 
 // planCandidateIndexes 在不可变候选快照上按下标规划，避免过滤阶段复制完整账号结构。
 // indexes 为 nil 时表示使用 values 的全部元素。
-func (s *Selector) planCandidateIndexes(ctx context.Context, values []account.RoutingCandidate, indexes []int, now time.Time, tierOrder []account.WebTier) (*candidatePlan, error) {
-	return s.planCandidateIndexesWithHints(ctx, values, indexes, now, tierOrder, nil, s.preferFreeBuildEnabled())
+func (s *Selector) planCandidateIndexes(ctx context.Context, values []account.RoutingCandidate, indexes []int, now time.Time, tierGroups account.WebTierGroups) (*candidatePlan, error) {
+	return s.planCandidateIndexesWithHints(ctx, values, indexes, now, tierGroups, nil, s.preferFreeBuildEnabled())
 }
 
-func (s *Selector) planCandidateIndexesWithHints(ctx context.Context, values []account.RoutingCandidate, indexes []int, now time.Time, tierOrder []account.WebTier, concurrencyHints []int, preferFreeBuild bool) (*candidatePlan, error) {
+func (s *Selector) planCandidateIndexesWithHints(ctx context.Context, values []account.RoutingCandidate, indexes []int, now time.Time, tierGroups account.WebTierGroups, concurrencyHints []int, preferFreeBuild bool) (*candidatePlan, error) {
 	length := len(indexes)
 	if indexes == nil {
 		length = len(values)
@@ -162,8 +162,9 @@ func (s *Selector) planCandidateIndexesWithHints(ctx context.Context, values []a
 			index = indexes[position]
 		}
 		candidate := values[index]
+		tierRank, _ := tierGroups.Rank(candidate.Credential.WebTier)
 		score := candidateScore{
-			index: index, tier: tierOrderRank(tierOrder, candidate.Credential.WebTier),
+			index: index, tier: tierRank,
 			preferFreeBuild: preferFreeBuild && candidate.IsKnownFreeBuild(),
 			inFlight:        inFlight[position], lastSelected: s.lastSelectedAt[candidate.Credential.ID],
 		}

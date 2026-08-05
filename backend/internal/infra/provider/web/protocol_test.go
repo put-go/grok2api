@@ -1058,21 +1058,23 @@ func TestWebMediaUpstreamDiagnosticLogsStageHeadersWithoutBodyPreview(t *testing
 	}
 }
 
-func TestChatModelsUseLowestSufficientTierFirst(t *testing.T) {
+func TestModelsUseExpectedTierGroups(t *testing.T) {
 	adapter := &Adapter{}
 	tests := []struct {
 		model string
-		want  []account.WebTier
+		want  account.WebTierGroups
 	}{
-		{model: "grok-chat-fast", want: []account.WebTier{account.WebTierBasic, account.WebTierSuper, account.WebTierHeavy}},
-		{model: "grok-chat-auto", want: []account.WebTier{account.WebTierSuper, account.WebTierHeavy}},
-		{model: "grok-chat-expert", want: []account.WebTier{account.WebTierSuper, account.WebTierHeavy}},
-		{model: "grok-chat-heavy", want: []account.WebTier{account.WebTierHeavy}},
+		{model: "grok-chat-fast", want: account.WebTierGroups{{account.WebTierBasic}, {account.WebTierSuper, account.WebTierHeavy}}},
+		{model: "grok-chat-auto", want: account.WebTierGroups{{account.WebTierSuper, account.WebTierHeavy}}},
+		{model: "grok-chat-expert", want: account.WebTierGroups{{account.WebTierSuper, account.WebTierHeavy}}},
+		{model: "grok-chat-heavy", want: account.WebTierGroups{{account.WebTierHeavy}}},
+		{model: "grok-imagine-video", want: account.WebTierGroups{{account.WebTierSuper, account.WebTierHeavy}}},
+		{model: "unknown", want: nil},
 	}
 	for _, test := range tests {
-		got := adapter.TierOrder(test.model)
-		if !slices.Equal(got, test.want) {
-			t.Fatalf("tier order for %s = %v, want %v", test.model, got, test.want)
+		got := adapter.TierGroups(test.model)
+		if !slices.EqualFunc(got, test.want, func(left, right []account.WebTier) bool { return slices.Equal(left, right) }) {
+			t.Fatalf("tier groups for %s = %v, want %v", test.model, got, test.want)
 		}
 	}
 }

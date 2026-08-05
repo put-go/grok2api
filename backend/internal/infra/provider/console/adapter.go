@@ -60,7 +60,7 @@ func (a *Adapter) QuotaMode(upstreamModel string) string {
 	return ""
 }
 
-func (a *Adapter) TierOrder(string) []account.WebTier { return nil }
+func (a *Adapter) TierGroups(string) account.WebTierGroups { return nil }
 
 func (a *Adapter) PricingModel(upstreamModel string) string { return upstreamModel }
 

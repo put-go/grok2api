@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	accountdomain "github.com/chenyme/grok2api/backend/internal/domain/account"
 	"github.com/chenyme/grok2api/backend/internal/infra/persistence/relational"
@@ -185,5 +186,35 @@ func TestUpdateBuildSuperEntitledBuildOnly(t *testing.T) {
 	}
 	if view.Credential.BuildSuperEntitled || view.Quota.Type != QuotaTypeUnknown {
 		t.Fatalf("cleared view = %#v quota=%#v", view.Credential, view.Quota)
+	}
+}
+
+func TestAccountUpdateMakesConcurrencyManual(t *testing.T) {
+	ctx := context.Background()
+	service, accounts := openAccountService(t)
+	value, _, err := accounts.UpsertByIdentity(ctx, accountdomain.Credential{
+		Provider: accountdomain.ProviderWeb, AuthType: accountdomain.AuthTypeSSO, WebTier: accountdomain.WebTierSuper,
+		Name: "managed-concurrency", SourceKey: "managed-concurrency", EncryptedAccessToken: "enc", AuthStatus: accountdomain.AuthStatusActive,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if value.MaxConcurrent != accountdomain.DefaultWebMaxConcurrent || !value.MaxConcurrentManaged {
+		t.Fatalf("initial concurrency = %d, managed = %t", value.MaxConcurrent, value.MaxConcurrentManaged)
+	}
+	manual := 3
+	if _, err := service.Update(ctx, value.ID, UpdateInput{MaxConcurrent: &manual}); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := accounts.Get(ctx, value.ID)
+	if err != nil || stored.MaxConcurrent != manual || stored.MaxConcurrentManaged {
+		t.Fatalf("stored = %#v, err = %v", stored, err)
+	}
+	if err := accounts.ReplaceQuotaWindows(ctx, value.ID, accountdomain.WebTierHeavy, time.Now().UTC(), nil); err != nil {
+		t.Fatal(err)
+	}
+	stored, err = accounts.Get(ctx, value.ID)
+	if err != nil || stored.MaxConcurrent != manual || stored.MaxConcurrentManaged {
+		t.Fatalf("stored after tier sync = %#v, err = %v", stored, err)
 	}
 }

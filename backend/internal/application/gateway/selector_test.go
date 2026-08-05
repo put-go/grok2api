@@ -524,7 +524,7 @@ func TestSelectorHonorsWebTierPoolOrderBeforeAccountPriority(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	selector := NewSelector(accounts, memory.NewConcurrencyLimiter(), memory.NewStickyStore(), staticTierOrder{order: []account.WebTier{account.WebTierHeavy, account.WebTierSuper, account.WebTierBasic}}, time.Hour, time.Second, time.Minute)
+	selector := NewSelector(accounts, memory.NewConcurrencyLimiter(), memory.NewStickyStore(), staticTierGroups{groups: account.WebTierGroups{{account.WebTierHeavy}, {account.WebTierSuper}, {account.WebTierBasic}}}, time.Hour, time.Second, time.Minute)
 	selector.UpdatePreferFreeBuild(true)
 	lease, err := selector.Acquire(ctx, account.ProviderWeb, 0, "fast-prefer-best", "fast", "", nil, false)
 	if err != nil {
@@ -533,6 +533,87 @@ func TestSelectorHonorsWebTierPoolOrderBeforeAccountPriority(t *testing.T) {
 	defer lease.Release()
 	if lease.Credential.WebTier != account.WebTierHeavy {
 		t.Fatalf("selected tier = %s", lease.Credential.WebTier)
+	}
+}
+
+func TestSelectorPoolsSuperAndHeavyBeforeApplyingPriority(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "selector-paid-tier-group.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	accounts := relational.NewAccountRepository(database)
+	create := func(name string, tier account.WebTier, priority int) account.Credential {
+		t.Helper()
+		value, _, createErr := accounts.UpsertByIdentity(ctx, account.Credential{
+			Provider: account.ProviderWeb, AuthType: account.AuthTypeSSO, WebTier: tier,
+			Name: name, SourceKey: name, EncryptedAccessToken: "encrypted",
+			AuthStatus: account.AuthStatusActive, Priority: priority, MaxConcurrent: 1,
+		})
+		if createErr != nil {
+			t.Fatal(createErr)
+		}
+		return value
+	}
+	basic := create("basic", account.WebTierBasic, 100)
+	_ = create("super", account.WebTierSuper, 1)
+	heavy := create("heavy", account.WebTierHeavy, 2)
+	selector := NewSelector(accounts, memory.NewConcurrencyLimiter(), memory.NewStickyStore(), staticTierGroups{groups: account.WebTierGroups{{account.WebTierSuper, account.WebTierHeavy}}}, time.Hour, time.Second, time.Minute)
+
+	lease, err := selector.Acquire(ctx, account.ProviderWeb, 0, "grok-imagine-video", "", "", nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Release()
+	if lease.Credential.ID != heavy.ID {
+		t.Fatalf("selected account = %d, want higher-priority Heavy %d", lease.Credential.ID, heavy.ID)
+	}
+
+	_, err = selector.AcquirePinned(ctx, account.ProviderWeb, basic.ID, 0, "grok-imagine-video", "", true)
+	var unavailable *SelectionUnavailableError
+	if !errors.As(err, &unavailable) || unavailable.Reason != SelectionUnsupportedModel {
+		t.Fatalf("pinned Basic error = %#v, err = %v", unavailable, err)
+	}
+}
+
+func TestSelectorBalancesEqualPriorityAcrossPaidTiers(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "selector-paid-tier-balance.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	accounts := relational.NewAccountRepository(database)
+	for _, tier := range []account.WebTier{account.WebTierSuper, account.WebTierHeavy} {
+		if _, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
+			Provider: account.ProviderWeb, AuthType: account.AuthTypeSSO, WebTier: tier,
+			Name: string(tier), SourceKey: string(tier), EncryptedAccessToken: "encrypted",
+			AuthStatus: account.AuthStatusActive, Priority: 1, MaxConcurrent: 1,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	selector := NewSelector(accounts, memory.NewConcurrencyLimiter(), memory.NewStickyStore(), staticTierGroups{groups: account.WebTierGroups{{account.WebTierSuper, account.WebTierHeavy}}}, time.Hour, time.Second, time.Minute)
+	first, err := selector.Acquire(ctx, account.ProviderWeb, 0, "grok-imagine-video", "", "", nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstID := first.Credential.ID
+	first.Release()
+	second, err := selector.Acquire(ctx, account.ProviderWeb, 0, "grok-imagine-video", "", "", nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Release()
+	if second.Credential.ID == firstID {
+		t.Fatalf("equal-priority paid pool selected account %d twice", firstID)
 	}
 }
 
@@ -572,7 +653,7 @@ func TestSelectorEnforcesClientKeyAccountScopeAcrossProvidersAndTiers(t *testing
 	_ = create(account.Credential{Provider: account.ProviderWeb, AuthType: account.AuthTypeSSO, WebTier: account.WebTierAuto, Name: "web-unknown", SourceKey: "web-unknown", EncryptedAccessToken: "encrypted", Enabled: true, AuthStatus: account.AuthStatusActive, Priority: 200, MaxConcurrent: 2})
 	console := create(account.Credential{Provider: account.ProviderConsole, AuthType: account.AuthTypeSSO, Name: "console", SourceKey: "console", EncryptedAccessToken: "encrypted", Enabled: true, AuthStatus: account.AuthStatusActive, Priority: 10, MaxConcurrent: 2})
 
-	selector := NewSelector(accounts, memory.NewConcurrencyLimiter(), memory.NewStickyStore(), staticTierOrder{order: []account.WebTier{account.WebTierBasic, account.WebTierSuper, account.WebTierHeavy}}, time.Hour, time.Second, time.Minute)
+	selector := NewSelector(accounts, memory.NewConcurrencyLimiter(), memory.NewStickyStore(), staticTierGroups{groups: account.WebTierGroups{{account.WebTierBasic}, {account.WebTierSuper, account.WebTierHeavy}}}, time.Hour, time.Second, time.Minute)
 	providerScope := func(provider account.Provider) clientkeydomain.ProviderScope {
 		switch provider {
 		case account.ProviderBuild:
@@ -783,7 +864,7 @@ func TestCandidatePlanPreservesSelectorOrdering(t *testing.T) {
 		newCandidate(6, account.WebTierHeavy, 10, true, true),
 		newCandidate(1, account.WebTierHeavy, 10, true, true),
 	}
-	plan, err := selector.planCandidates(context.Background(), values, now, []account.WebTier{account.WebTierHeavy, account.WebTierSuper})
+	plan, err := selector.planCandidates(context.Background(), values, now, account.WebTierGroups{{account.WebTierHeavy}, {account.WebTierSuper}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1062,10 +1143,10 @@ func (l *batchConcurrencyLimiter) CurrentMany(_ context.Context, keys []string) 
 	return values, nil
 }
 
-type staticTierOrder struct{ order []account.WebTier }
+type staticTierGroups struct{ groups account.WebTierGroups }
 
-func (value staticTierOrder) TierOrder(account.Provider, string) []account.WebTier {
-	return value.order
+func (value staticTierGroups) TierGroups(account.Provider, string) account.WebTierGroups {
+	return value.groups
 }
 
 func (f failingConcurrencyLimiter) Acquire(context.Context, string, int) (func(), bool, error) {

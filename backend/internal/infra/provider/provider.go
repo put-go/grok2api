@@ -421,7 +421,7 @@ type VideoContentDownloader interface {
 type RoutingMetadataAdapter interface {
 	Adapter
 	QuotaMode(upstreamModel string) string
-	TierOrder(upstreamModel string) []account.WebTier
+	TierGroups(upstreamModel string) account.WebTierGroups
 }
 
 // ModelAlias resolves a hidden compatibility model name to one public route and can fix reasoning effort.
@@ -763,7 +763,7 @@ func (r *Registry) QuotaMode(value account.Provider, upstreamModel string) strin
 	return metadata.QuotaMode(upstreamModel)
 }
 
-func (r *Registry) TierOrder(value account.Provider, upstreamModel string) []account.WebTier {
+func (r *Registry) TierGroups(value account.Provider, upstreamModel string) account.WebTierGroups {
 	adapter, ok := r.Get(value)
 	if !ok {
 		return nil
@@ -772,7 +772,7 @@ func (r *Registry) TierOrder(value account.Provider, upstreamModel string) []acc
 	if !ok {
 		return nil
 	}
-	return metadata.TierOrder(upstreamModel)
+	return metadata.TierGroups(upstreamModel)
 }
 
 func (r *Registry) PricingModel(value account.Provider, upstreamModel string) string {

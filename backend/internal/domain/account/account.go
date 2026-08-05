@@ -73,6 +73,30 @@ const (
 	WebTierHeavy WebTier = "heavy"
 )
 
+// WebTierGroups expresses routing preference groups. Tiers in the same group
+// are scheduled together; groups later in the slice are fallbacks.
+type WebTierGroups [][]WebTier
+
+// Rank returns the preference group and whether the tier is eligible. An empty
+// policy is unrestricted, which keeps non-Web providers and unknown routes
+// compatible with the existing selector behavior.
+func (groups WebTierGroups) Rank(tier WebTier) (int, bool) {
+	if len(groups) == 0 {
+		return 0, true
+	}
+	if tier == "" || tier == WebTierAuto {
+		tier = WebTierBasic
+	}
+	for rank, group := range groups {
+		for _, candidate := range group {
+			if candidate == tier {
+				return rank, true
+			}
+		}
+	}
+	return len(groups), false
+}
+
 // BuildRouteMode 控制 Build 账号的推理地址；模型、Billing 与 OAuth 不受影响。
 type BuildRouteMode string
 
@@ -96,11 +120,27 @@ func (m BuildRouteMode) IsValid() bool {
 }
 
 const (
-	DefaultPriority         = 1
-	DefaultMaxConcurrent    = 8
-	DefaultMinimumRemaining = 0
-	MaxConcurrent           = 256
+	DefaultPriority              = 1
+	DefaultMaxConcurrent         = 8
+	DefaultWebMaxConcurrent      = 2
+	DefaultWebHeavyMaxConcurrent = 6
+	DefaultMinimumRemaining      = 0
+	MaxConcurrent                = 256
 )
+
+// DefaultMaxConcurrentFor returns the managed concurrency default for an
+// account. Non-Web providers retain the historical shared default.
+func DefaultMaxConcurrentFor(provider Provider, tier WebTier) int {
+	if provider == ProviderWeb {
+		switch tier {
+		case WebTierSuper:
+			return DefaultWebMaxConcurrent
+		case WebTierHeavy:
+			return DefaultWebHeavyMaxConcurrent
+		}
+	}
+	return DefaultMaxConcurrent
+}
 
 // AuthStatus 表示账号凭据的认证状态。
 type AuthStatus string
@@ -149,18 +189,20 @@ type Credential struct {
 	Enabled                   bool
 	AuthStatus                AuthStatus
 	// ReauthMarkedAt 仅在切入 reauthRequired 时写入；恢复 active 时清空。自动清理以该时刻为 minAge 锚点。
-	ReauthMarkedAt   *time.Time
-	Priority         int
-	MaxConcurrent    int
-	MinimumRemaining float64
-	FailureCount     int
-	CooldownUntil    *time.Time
-	LastError        string
-	LastUsedAt       *time.Time
-	ObservedModel    string
-	ObservedModelAt  *time.Time
-	WebTier          WebTier
-	WebTierSyncedAt  *time.Time
+	ReauthMarkedAt *time.Time
+	Priority       int
+	MaxConcurrent  int
+	// MaxConcurrentManaged is true while maxConcurrent follows the Web tier default.
+	MaxConcurrentManaged bool
+	MinimumRemaining     float64
+	FailureCount         int
+	CooldownUntil        *time.Time
+	LastError            string
+	LastUsedAt           *time.Time
+	ObservedModel        string
+	ObservedModelAt      *time.Time
+	WebTier              WebTier
+	WebTierSyncedAt      *time.Time
 	// EgressIdentity 是不含凭据和个人信息的稳定出口身份。
 	// 关联到同一 Web 账号的 Build/Console 只共享该值，不共享任何运行状态。
 	EgressIdentity string

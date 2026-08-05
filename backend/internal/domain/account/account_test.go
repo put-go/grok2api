@@ -64,6 +64,50 @@ func TestBuildRouteModeValidation(t *testing.T) {
 	}
 }
 
+func TestWebTierGroupsRank(t *testing.T) {
+	groups := WebTierGroups{{WebTierBasic}, {WebTierSuper, WebTierHeavy}}
+	tests := []struct {
+		tier    WebTier
+		rank    int
+		allowed bool
+	}{
+		{tier: WebTierAuto, rank: 0, allowed: true},
+		{tier: WebTierBasic, rank: 0, allowed: true},
+		{tier: WebTierSuper, rank: 1, allowed: true},
+		{tier: WebTierHeavy, rank: 1, allowed: true},
+		{tier: "unknown", rank: 2, allowed: false},
+	}
+	for _, test := range tests {
+		rank, allowed := groups.Rank(test.tier)
+		if rank != test.rank || allowed != test.allowed {
+			t.Fatalf("tier %q rank = %d, allowed = %t; want %d, %t", test.tier, rank, allowed, test.rank, test.allowed)
+		}
+	}
+	if rank, allowed := (WebTierGroups(nil)).Rank("unknown"); rank != 0 || !allowed {
+		t.Fatalf("unrestricted policy rank = %d, allowed = %t", rank, allowed)
+	}
+}
+
+func TestDefaultMaxConcurrentFor(t *testing.T) {
+	tests := []struct {
+		provider Provider
+		tier     WebTier
+		want     int
+	}{
+		{provider: ProviderWeb, tier: WebTierSuper, want: 2},
+		{provider: ProviderWeb, tier: WebTierHeavy, want: 6},
+		{provider: ProviderWeb, tier: WebTierAuto, want: DefaultMaxConcurrent},
+		{provider: ProviderWeb, tier: WebTierBasic, want: DefaultMaxConcurrent},
+		{provider: ProviderBuild, tier: WebTierHeavy, want: DefaultMaxConcurrent},
+		{provider: ProviderConsole, tier: WebTierSuper, want: DefaultMaxConcurrent},
+	}
+	for _, test := range tests {
+		if got := DefaultMaxConcurrentFor(test.provider, test.tier); got != test.want {
+			t.Fatalf("default concurrency for %s/%s = %d, want %d", test.provider, test.tier, got, test.want)
+		}
+	}
+}
+
 func TestIsBuildSuper(t *testing.T) {
 	paid := Billing{MonthlyLimit: 100}
 	zeroFree := Billing{IsUnifiedBillingUser: true}

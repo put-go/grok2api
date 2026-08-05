@@ -251,9 +251,9 @@ export function AccountsPage() {
         name: values.name,
         enabled: values.enabled,
         priority: values.priority,
-        maxConcurrent: values.maxConcurrent,
         minimumRemaining: values.minimumRemaining,
       };
+      if (values.maxConcurrent !== editing.maxConcurrent) input.maxConcurrent = values.maxConcurrent;
       if (editing.provider !== "grok_build") {
         if (values.clearCloudflareCookies) input.clearCloudflareCookies = true;
         else if (values.cloudflareCookies.trim()) input.cloudflareCookies = values.cloudflareCookies;
