@@ -71,6 +71,25 @@ func (s *Service) EnableWebNSFW(ctx context.Context, id uint64) error {
 	return s.runSingleWebAccountScript(ctx, id, WebAccountScriptOptions{EnableNSFW: true})
 }
 
+type webQuotaResetter interface {
+	RedeemQuotaReset(context.Context, accountdomain.Credential) error
+}
+
+// RedeemWebQuotaReset submits the Grok Web quota-reset request for one account.
+func (s *Service) RedeemWebQuotaReset(ctx context.Context, id uint64) error {
+	credential, settings, err := s.webAccountSettings(ctx, id)
+	if err != nil {
+		return err
+	}
+	adapter, ok := settings.(webQuotaResetter)
+	if !ok {
+		return fmt.Errorf("%w: Grok Web Provider 不支持额度重置", ErrUnsupported)
+	}
+	return s.runWebAccountSetting(ctx, credential, "重置 Grok Web 额度", func() error {
+		return adapter.RedeemQuotaReset(ctx, credential)
+	})
+}
+
 func (s *Service) runWebAccountScript(ctx context.Context, id uint64, options WebAccountScriptOptions) error {
 	options, err := normalizeWebAccountScriptOptions(options)
 	if err != nil {
