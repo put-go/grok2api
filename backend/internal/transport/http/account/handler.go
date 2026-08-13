@@ -167,6 +167,7 @@ func (h *Handler) Register(router *gin.RouterGroup) {
 	router.POST("/accounts/:id/refresh-token", h.refreshToken)
 	router.POST("/accounts/:id/refresh-billing", h.refreshBilling)
 	router.POST("/accounts/:id/refresh-quota", h.refreshWebQuota)
+	router.POST("/accounts/:id/redeem-reset", h.redeemWebQuotaReset)
 }
 
 type updateRequest struct {
@@ -1084,6 +1085,18 @@ func (h *Handler) refreshWebQuota(c *gin.Context) {
 		return
 	}
 	response.Success(c, http.StatusOK, newAccountResponse(value))
+}
+
+func (h *Handler) redeemWebQuotaReset(c *gin.Context) {
+	id, ok := pathID(c)
+	if !ok {
+		return
+	}
+	if err := h.service.RedeemWebQuotaReset(c.Request.Context(), id); err != nil {
+		h.writeServiceError(c, "quotaResetRedeemFailed", err, http.StatusBadGateway, "重置 Grok Web 额度失败")
+		return
+	}
+	response.Success(c, http.StatusOK, gin.H{"completed": true})
 }
 
 func (h *Handler) exportCredentials(c *gin.Context) {

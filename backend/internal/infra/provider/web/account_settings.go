@@ -28,6 +28,7 @@ const (
 
 var (
 	acceptTermsBody = []byte{0x00, 0x00, 0x00, 0x00, 0x02, 0x10, 0x01}
+	quotaResetBody  = []byte{0x00, 0x00, 0x00, 0x00, 0x0f, 0x52, 0x0d, 'r', 'e', 's', 't', 'o', 'k', '_', 'v', 'p', 'Y', 'D', 'q', 'o'}
 	enableNSFWBody  = []byte{
 		0x00, 0x00, 0x00, 0x00, 0x20,
 		0x0a, 0x02, 0x10, 0x01,
@@ -116,6 +117,17 @@ func (a *Adapter) EnableNSFW(ctx context.Context, credential account.Credential)
 	})
 }
 
+// RedeemQuotaReset submits Grok Web's quota-reset request for one account.
+func (a *Adapter) RedeemQuotaReset(ctx context.Context, credential account.Credential) error {
+	baseURL := strings.TrimRight(a.config().BaseURL, "/")
+	return a.runWebAccountSetting(ctx, credential, webAccountSettingRequest{
+		endpoint: baseURL + "/prod_mc_billing.ConsumerUiSvc/RedeemReset", body: quotaResetBody,
+		contentType: "application/grpc-web+proto", origin: baseURL,
+		referer: baseURL + "/?q=&reasoningMode=none&voice=false&_s=usage",
+		grpcWeb: true, connectES: true, noRequestID: true,
+	})
+}
+
 type webAccountSettingRequest struct {
 	endpoint    string
 	body        []byte
@@ -127,6 +139,7 @@ type webAccountSettingRequest struct {
 	statsig     bool
 	clientHints bool
 	withoutCF   bool
+	noRequestID bool
 }
 
 func (a *Adapter) runWebAccountSetting(ctx context.Context, credential account.Credential, input webAccountSettingRequest) error {
@@ -166,6 +179,9 @@ func (a *Adapter) executeWebAccountSetting(ctx context.Context, token string, le
 			return requestErr
 		}
 		request.Header = buildHeaders(token, lease, input.contentType)
+		if input.noRequestID {
+			request.Header.Del("x-xai-request-id")
+		}
 		if input.withoutCF {
 			request.Header.Set("Cookie", infraegress.BuildSSOCookie(token, ""))
 		}

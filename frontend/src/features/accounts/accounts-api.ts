@@ -318,6 +318,10 @@ export function enableWebAccountNSFW(id: string): Promise<{ completed: boolean }
 export type AccountBatchResultDTO = { succeeded: number; failed: number };
 export type AccountTokenRefreshResultDTO = AccountBatchResultDTO & { skipped: number };
 
+export function redeemWebAccountReset(id: string): Promise<{ completed: boolean }> {
+  return apiRequest(`/api/admin/v1/accounts/${id}/redeem-reset`, { method: "POST" }, decodeBooleanResult<{ completed: boolean }>("completed"));
+}
+
 export type BuildConversionResultDTO = {
   created: number;
   linked: number;
