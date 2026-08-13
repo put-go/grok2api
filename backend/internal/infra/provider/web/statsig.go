@@ -417,9 +417,25 @@ func fetchStatsigMetaContent(ctx context.Context, baseURL, token string, lease *
 	}
 	requestCtx, cancel := context.WithTimeout(infraegress.WithPhysicalCallStage(ctx, "statsig_meta"), 15*time.Second)
 	defer cancel()
-	request, err := http.NewRequestWithContext(requestCtx, http.MethodGet, strings.TrimRight(baseURL, "/")+"/index", nil)
-	if err != nil {
+	baseURL = strings.TrimRight(baseURL, "/")
+	content, status, err := fetchStatsigMetaPage(requestCtx, baseURL+"/index", token, lease)
+	if err == nil {
+		return content, nil
+	}
+	if status != http.StatusNotFound {
 		return "", err
+	}
+	content, _, fallbackErr := fetchStatsigMetaPage(requestCtx, baseURL+"/", token, lease)
+	if fallbackErr != nil {
+		return "", fmt.Errorf("Grok index 返回 404，根页面回退失败: %w", fallbackErr)
+	}
+	return content, nil
+}
+
+func fetchStatsigMetaPage(ctx context.Context, endpoint, token string, lease *infraegress.Lease) (string, int, error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return "", 0, err
 	}
 	request.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
 	request.Header.Set("Accept-Encoding", "gzip, deflate, br, zstd")
@@ -434,24 +450,24 @@ func fetchStatsigMetaContent(ctx context.Context, baseURL, token string, lease *
 	request.Header.Set("Cookie", infraegress.BuildSSOCookie(token, lease.CFCookies))
 	response, err := lease.Do(request)
 	if err != nil {
-		return "", err
+		return "", 0, err
 	}
 	defer response.Body.Close()
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return "", fmt.Errorf("Grok index 返回 %d", response.StatusCode)
+		return "", response.StatusCode, fmt.Errorf("Grok Statsig 页面 %s 返回 %d", request.URL.EscapedPath(), response.StatusCode)
 	}
 	body, err := io.ReadAll(io.LimitReader(response.Body, statsigMetaBodyLimit+1))
 	if err != nil {
-		return "", err
+		return "", response.StatusCode, err
 	}
 	if len(body) > statsigMetaBodyLimit {
-		return "", fmt.Errorf("Grok index 超过安全上限")
+		return "", response.StatusCode, fmt.Errorf("Grok Statsig 页面超过安全上限")
 	}
 	content, err := extractStatsigMetaContent(body)
 	if err != nil {
-		return "", err
+		return "", response.StatusCode, err
 	}
-	return content, nil
+	return content, response.StatusCode, nil
 }
 
 func extractStatsigMetaContent(body []byte) (string, error) {

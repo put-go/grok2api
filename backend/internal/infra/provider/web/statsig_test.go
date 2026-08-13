@@ -8,12 +8,15 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	egressdomain "github.com/chenyme/grok2api/backend/internal/domain/egress"
 	infraegress "github.com/chenyme/grok2api/backend/internal/infra/egress"
+	"github.com/chenyme/grok2api/backend/internal/infra/security"
 )
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
@@ -28,6 +31,66 @@ func TestExtractStatsigMetaContentAcceptsCurrentMetaName(t *testing.T) {
 			t.Fatalf("name=%q value=%q err=%v", name, value, err)
 		}
 	}
+}
+
+func TestFetchStatsigMetaContentPrefersIndexPath(t *testing.T) {
+	var paths []string
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		paths = append(paths, request.URL.Path)
+		if request.Method != http.MethodGet || request.URL.Path != "/index" {
+			http.NotFound(writer, request)
+			return
+		}
+		_, _ = writer.Write([]byte(`<html><head><meta name="grok-site-verification" content="index-meta"></head></html>`))
+	}))
+	defer server.Close()
+
+	lease := newStatsigMetaTestLease(t)
+	defer lease.Release()
+	value, err := fetchStatsigMetaContent(context.Background(), server.URL, "sso-token", lease)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if value != "index-meta" || len(paths) != 1 || paths[0] != "/index" {
+		t.Fatalf("meta=%q paths=%v", value, paths)
+	}
+}
+
+func TestFetchStatsigMetaContentFallsBackToRootAfterIndexNotFound(t *testing.T) {
+	var paths []string
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		paths = append(paths, request.URL.Path)
+		if request.Method != http.MethodGet || request.URL.Path != "/" {
+			http.NotFound(writer, request)
+			return
+		}
+		_, _ = writer.Write([]byte(`<html><head><meta name="grok-site-verification" content="root-meta"></head></html>`))
+	}))
+	defer server.Close()
+
+	lease := newStatsigMetaTestLease(t)
+	defer lease.Release()
+	value, err := fetchStatsigMetaContent(context.Background(), server.URL+"/", "sso-token", lease)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if value != "root-meta" || len(paths) != 2 || paths[0] != "/index" || paths[1] != "/" {
+		t.Fatalf("meta=%q paths=%v", value, paths)
+	}
+}
+
+func newStatsigMetaTestLease(t *testing.T) *infraegress.Lease {
+	t.Helper()
+	cipher, err := security.NewCipher(base64.StdEncoding.EncodeToString(make([]byte, 32)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := infraegress.NewManager(egressRepositoryStub{}, cipher)
+	lease, err := manager.Acquire(context.Background(), egressdomain.ScopeWeb, "statsig-meta")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return lease
 }
 
 func TestStatsigSignerSendsMethodPathAndMetaContent(t *testing.T) {
