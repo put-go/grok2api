@@ -45,6 +45,13 @@ const (
 	buildControlTimeout     = 30 * time.Second
 )
 
+var buildModelCapabilityCompatibilities = []struct {
+	advertised string
+	additional []string
+}{
+	{advertised: "grok-4.6", additional: []string{"grok-4.5"}},
+}
+
 // Adapter implements the Grok Build CLI Responses, model, Billing, and OAuth protocols.
 type Adapter struct {
 	cfgMu          sync.RWMutex
@@ -560,7 +567,7 @@ func (a *Adapter) ListModels(ctx context.Context, credential account.Credential)
 		return nil, err
 	}
 	// Always request the model catalog from the Build primary; do not preemptively switch to XAI because 1.5 or Super entitlement is absent.
-	// NormalizeAccountModelCapabilities fills 1.5 locally from Billing paid or BuildSuperEntitled.
+	// NormalizeAccountModelCapabilities derives same-account compatibility and 1.5 entitlement locally.
 	models, status, err := a.listModelsAt(ctx, credential, accessToken, a.primaryBaseURL())
 	if err != nil {
 		return nil, err
@@ -571,12 +578,12 @@ func (a *Adapter) ListModels(ctx context.Context, credential account.Credential)
 	return nil, fmt.Errorf("上游模型接口返回 %d", status)
 }
 
-// NormalizeAccountModelCapabilities normalizes 1.5 video entitlement from Super (Billing paid or BuildSuperEntitled).
+// NormalizeAccountModelCapabilities normalizes derived Build capabilities from the account's own catalog and entitlement.
 // Super always includes grok-imagine-video-1.5; Free and Unknown remove it exactly. BuildAPIFallback is ignored.
 func (a *Adapter) NormalizeAccountModelCapabilities(models []string, billing *account.Billing, credential account.Credential) []string {
 	super := account.IsBuildSuper(credential, billing)
-	result := make([]string, 0, len(models)+1)
-	seen := make(map[string]struct{}, len(models)+1)
+	result := make([]string, 0, len(models)+1+len(buildModelCapabilityCompatibilities))
+	seen := make(map[string]struct{}, len(models)+1+len(buildModelCapabilityCompatibilities))
 	hasVideo15 := false
 	for _, model := range models {
 		model = strings.TrimSpace(model)
@@ -594,6 +601,20 @@ func (a *Adapter) NormalizeAccountModelCapabilities(models []string, billing *ac
 		}
 		seen[model] = struct{}{}
 		result = append(result, model)
+	}
+	// The Build catalog can stop advertising a legacy identifier while the same account still accepts it.
+	// Expand only from identifiers returned by this account so Free capability isolation remains intact.
+	for _, compatibility := range buildModelCapabilityCompatibilities {
+		if _, advertised := seen[compatibility.advertised]; !advertised {
+			continue
+		}
+		for _, model := range compatibility.additional {
+			if _, exists := seen[model]; exists {
+				continue
+			}
+			seen[model] = struct{}{}
+			result = append(result, model)
+		}
 	}
 	if super && !hasVideo15 {
 		result = append(result, buildVideoModel)

@@ -501,6 +501,36 @@ func TestNormalizeAccountModelCapabilitiesSuperAddsVideo15(t *testing.T) {
 	}
 }
 
+func TestNormalizeAccountModelCapabilitiesBackfillsGrok45From46(t *testing.T) {
+	adapter := &Adapter{}
+	build := account.Credential{Provider: account.ProviderBuild}
+	tests := []struct {
+		name    string
+		models  []string
+		billing *account.Billing
+		want    []string
+	}{
+		{name: "free current catalog", models: []string{"grok-4.6"}, billing: &account.Billing{PlanName: "free"}, want: []string{"grok-4.6", "grok-4.5"}},
+		{name: "unknown current catalog", models: []string{"grok-4.6"}, want: []string{"grok-4.6", "grok-4.5"}},
+		{name: "super current catalog", models: []string{"grok-4.6"}, billing: &account.Billing{MonthlyLimit: 100}, want: []string{"grok-4.6", "grok-4.5", buildVideoModel}},
+		{name: "legacy already advertised", models: []string{"grok-4.6", "grok-4.5", "grok-4.5"}, billing: &account.Billing{PlanName: "free"}, want: []string{"grok-4.6", "grok-4.5"}},
+		{name: "unrelated catalog", models: []string{"grok-build-0.1"}, billing: &account.Billing{PlanName: "free"}, want: []string{"grok-build-0.1"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := adapter.NormalizeAccountModelCapabilities(test.models, test.billing, build)
+			if len(got) != len(test.want) {
+				t.Fatalf("capabilities = %#v, want %#v", got, test.want)
+			}
+			for index := range test.want {
+				if got[index] != test.want[index] {
+					t.Fatalf("capabilities = %#v, want %#v", got, test.want)
+				}
+			}
+		})
+	}
+}
+
 func TestGrokSessionIDFollowsConversationIdentity(t *testing.T) {
 	explicit := "019f6b02-5bae-7cf3-b26e-73e85c861749"
 	if value, err := grokSessionID(explicit); err != nil || value != explicit {

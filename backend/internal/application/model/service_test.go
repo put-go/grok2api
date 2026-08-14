@@ -110,9 +110,9 @@ func TestSyncAggregatesCapabilitiesFromAllAccounts(t *testing.T) {
 	}
 }
 
-func TestSyncAccountNormalizesBuildVideo15ByBillingSuper(t *testing.T) {
+func TestSyncAccountNormalizesBuildCapabilities(t *testing.T) {
 	ctx := context.Background()
-	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "model-build-video15.db"))
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "model-build-capabilities.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -150,11 +150,19 @@ func TestSyncAccountNormalizesBuildVideo15ByBillingSuper(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Free: Billing has no paid signal, but the upstream catalog exposes 1.5.
+	// Free: the upstream catalog advertises 4.6 and 1.5; normalization backfills 4.5 and removes 1.5.
 	freeAccount, _, err := accountRepo.UpsertByIdentity(ctx, account.Credential{
 		Provider: account.ProviderBuild, Name: "free-fallback", SourceKey: "free-fallback",
 		EncryptedAccessToken: encrypted, ExpiresAt: time.Now().Add(time.Hour), AuthStatus: account.AuthStatusActive,
 		BuildAPIFallback: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Another Free account without 4.6 must not receive the compatibility capability.
+	freeUnrelated, _, err := accountRepo.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, Name: "free-unrelated", SourceKey: "free-unrelated",
+		EncryptedAccessToken: encrypted, ExpiresAt: time.Now().Add(time.Hour), AuthStatus: account.AuthStatusActive,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -186,12 +194,16 @@ func TestSyncAccountNormalizesBuildVideo15ByBillingSuper(t *testing.T) {
 	if err := accountRepo.SaveBilling(ctx, account.Billing{AccountID: freeAccount.ID, Used: 1, PlanName: "free", SyncedAt: now}); err != nil {
 		t.Fatal(err)
 	}
+	if err := accountRepo.SaveBilling(ctx, account.Billing{AccountID: freeUnrelated.ID, PlanName: "free", SyncedAt: now}); err != nil {
+		t.Fatal(err)
+	}
 
 	const video15 = "grok-imagine-video-1.5"
 	buildAdapter := &buildCapabilityNormalizerAdapter{modelCapabilityAdapter: &modelCapabilityAdapter{models: map[uint64][]string{
 		superPrimary.ID:   {"grok-4.5"},
 		superFallback.ID:  {"grok-4.5", video15, "grok-code-fast-1", video15},
-		freeAccount.ID:    {"grok-4.5", video15},
+		freeAccount.ID:    {"grok-4.6", video15},
+		freeUnrelated.ID:  {"grok-code-fast-1"},
 		unknownAccount.ID: {video15, "grok-4.5"},
 	}}}
 	webAdapter := &modelCapabilityAdapter{provider: account.ProviderWeb, models: map[uint64][]string{
@@ -201,7 +213,7 @@ func TestSyncAccountNormalizesBuildVideo15ByBillingSuper(t *testing.T) {
 	accountService := accountapp.NewService(accountRepo, auditRepo, memory.NewDeviceSessionStore(), memory.NewStickyStore(), registry, cipher, nil)
 	service := NewService(modelRepo, accountRepo, accountService, registry)
 
-	for _, id := range []uint64{superPrimary.ID, superFallback.ID, freeAccount.ID, unknownAccount.ID, webAccount.ID} {
+	for _, id := range []uint64{superPrimary.ID, superFallback.ID, freeAccount.ID, freeUnrelated.ID, unknownAccount.ID, webAccount.ID} {
 		if _, err := service.SyncAccount(ctx, id); err != nil {
 			t.Fatalf("sync account %d: %v", id, err)
 		}
@@ -234,7 +246,13 @@ func TestSyncAccountNormalizesBuildVideo15ByBillingSuper(t *testing.T) {
 	assertSupports(unknownAccount.ID, video15, false)
 	assertSupports(superPrimary.ID, "grok-4.5", true)
 	assertSupports(superFallback.ID, "grok-code-fast-1", true)
+	assertSupports(freeAccount.ID, "grok-4.6", true)
 	assertSupports(freeAccount.ID, "grok-4.5", true)
+	assertSupports(freeUnrelated.ID, "grok-4.5", false)
+	textRoute, err := modelRepo.GetByPublicID(ctx, "Build/grok-4.5")
+	if err != nil || len(textRoute.BoundAccountIDs) != 0 {
+		t.Fatalf("build text route = %#v, err = %v", textRoute, err)
+	}
 
 	// Build 1.5 routes default to the video capability.
 	route, err := modelRepo.GetByPublicID(ctx, "Build/"+video15)
@@ -337,11 +355,15 @@ type buildCapabilityNormalizerAdapter struct {
 }
 
 func (a *buildCapabilityNormalizerAdapter) NormalizeAccountModelCapabilities(models []string, billing *account.Billing, credential account.Credential) []string {
-	// Match cli.Adapter rules: Super (paid or entitlement) ensures 1.5; otherwise remove it exactly. Ignore BuildAPIFallback.
-	const video15 = "grok-imagine-video-1.5"
+	// Match cli.Adapter rules: derive same-account compatibility and Super video entitlement. Ignore BuildAPIFallback.
+	const (
+		video15 = "grok-imagine-video-1.5"
+		current = "grok-4.6"
+		legacy  = "grok-4.5"
+	)
 	super := account.IsBuildSuper(credential, billing)
-	result := make([]string, 0, len(models)+1)
-	seen := make(map[string]struct{}, len(models)+1)
+	result := make([]string, 0, len(models)+2)
+	seen := make(map[string]struct{}, len(models)+2)
 	hasVideo15 := false
 	for _, modelName := range models {
 		if modelName == "" {
@@ -358,6 +380,12 @@ func (a *buildCapabilityNormalizerAdapter) NormalizeAccountModelCapabilities(mod
 		}
 		seen[modelName] = struct{}{}
 		result = append(result, modelName)
+	}
+	if _, advertised := seen[current]; advertised {
+		if _, exists := seen[legacy]; !exists {
+			seen[legacy] = struct{}{}
+			result = append(result, legacy)
+		}
 	}
 	if super && !hasVideo15 {
 		result = append(result, video15)
