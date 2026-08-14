@@ -31,6 +31,36 @@ func TestModelProviderFilterAcceptsOnlyKnownProviders(t *testing.T) {
 	}
 }
 
+func TestEndpointCapabilitiesFollowProviderSurface(t *testing.T) {
+	routes := []modeldomain.Route{
+		{Provider: account.ProviderConsole, Capability: modeldomain.CapabilityResponses},
+		{Provider: account.ProviderConsole, Capability: modeldomain.CapabilityImage},
+		{Provider: account.ProviderConsole, Capability: modeldomain.CapabilityImageEdit},
+	}
+	capabilities := endpointCapabilitiesForDefinition(routes, provider.Definition{
+		Conversation: provider.ConversationSurface{Responses: true, Messages: true},
+		Media:        provider.MediaSurface{ImageGeneration: true},
+	})
+	want := []string{"responses", "messages", "image"}
+	if fmt.Sprint(capabilities) != fmt.Sprint(want) {
+		t.Fatalf("endpoint capabilities = %v, want %v", capabilities, want)
+	}
+}
+
+func TestNormalizeBatchIDsAllowsGroupedRouteExpansion(t *testing.T) {
+	ids := make([]uint64, maxModelBatchSize)
+	for index := range ids {
+		ids[index] = uint64(index + 1)
+	}
+	if values, err := normalizeModelRouteBatchIDs(ids); err != nil || len(values) != maxModelBatchSize {
+		t.Fatalf("expanded grouped batch = %d, err=%v", len(values), err)
+	}
+	ids = append(ids, uint64(maxModelBatchSize+1))
+	if _, err := normalizeModelRouteBatchIDs(ids); err == nil {
+		t.Fatal("oversized grouped batch was accepted")
+	}
+}
+
 func TestSyncAggregatesCapabilitiesFromAllAccounts(t *testing.T) {
 	ctx := context.Background()
 	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "model-sync.db"))
@@ -135,7 +165,7 @@ func TestSyncAccountNormalizesBuildCapabilities(t *testing.T) {
 
 	// Super on primary Build: upstream exposes only grok-4.5 and fallback is disabled.
 	superPrimary, _, err := accountRepo.UpsertByIdentity(ctx, account.Credential{
-		Provider: account.ProviderBuild, Name: "super-primary", SourceKey: "super-primary",
+		Provider: account.ProviderBuild, AuthType: account.AuthTypeOAuth, Name: "super-primary", SourceKey: "super-primary",
 		EncryptedAccessToken: encrypted, ExpiresAt: time.Now().Add(time.Hour), AuthStatus: account.AuthStatusActive,
 	})
 	if err != nil {
@@ -143,7 +173,7 @@ func TestSyncAccountNormalizesBuildCapabilities(t *testing.T) {
 	}
 	// Super with fallback: the upstream catalog includes 1.5 and other models.
 	superFallback, _, err := accountRepo.UpsertByIdentity(ctx, account.Credential{
-		Provider: account.ProviderBuild, Name: "super-fallback", SourceKey: "super-fallback",
+		Provider: account.ProviderBuild, AuthType: account.AuthTypeOAuth, Name: "super-fallback", SourceKey: "super-fallback",
 		EncryptedAccessToken: encrypted, ExpiresAt: time.Now().Add(time.Hour), AuthStatus: account.AuthStatusActive,
 		BuildAPIFallback: true,
 	})
@@ -152,7 +182,7 @@ func TestSyncAccountNormalizesBuildCapabilities(t *testing.T) {
 	}
 	// Free: the upstream catalog advertises 4.6 and 1.5; normalization backfills 4.5 and removes 1.5.
 	freeAccount, _, err := accountRepo.UpsertByIdentity(ctx, account.Credential{
-		Provider: account.ProviderBuild, Name: "free-fallback", SourceKey: "free-fallback",
+		Provider: account.ProviderBuild, AuthType: account.AuthTypeOAuth, Name: "free-fallback", SourceKey: "free-fallback",
 		EncryptedAccessToken: encrypted, ExpiresAt: time.Now().Add(time.Hour), AuthStatus: account.AuthStatusActive,
 		BuildAPIFallback: true,
 	})
@@ -169,7 +199,7 @@ func TestSyncAccountNormalizesBuildCapabilities(t *testing.T) {
 	}
 	// Unknown: no Billing snapshot and the upstream catalog exposes 1.5.
 	unknownAccount, _, err := accountRepo.UpsertByIdentity(ctx, account.Credential{
-		Provider: account.ProviderBuild, Name: "unknown", SourceKey: "unknown",
+		Provider: account.ProviderBuild, AuthType: account.AuthTypeOAuth, Name: "unknown", SourceKey: "unknown",
 		EncryptedAccessToken: encrypted, ExpiresAt: time.Now().Add(time.Hour), AuthStatus: account.AuthStatusActive,
 	})
 	if err != nil {
@@ -253,11 +283,18 @@ func TestSyncAccountNormalizesBuildCapabilities(t *testing.T) {
 	if err != nil || len(textRoute.BoundAccountIDs) != 0 {
 		t.Fatalf("build text route = %#v, err = %v", textRoute, err)
 	}
+	for _, accountID := range []uint64{superPrimary.ID, superFallback.ID, freeAccount.ID, unknownAccount.ID} {
+		assertSupports(accountID, modeldomain.GrokComposer25Fast, true)
+	}
 
 	// Build 1.5 routes default to the video capability.
 	route, err := modelRepo.GetByPublicID(ctx, "Build/"+video15)
 	if err != nil || route.Capability != modeldomain.CapabilityVideo {
 		t.Fatalf("build video route = %#v, err = %v", route, err)
+	}
+	composerRoute, err := modelRepo.GetByPublicID(ctx, modeldomain.GrokComposer25Fast)
+	if err != nil || composerRoute.Provider != account.ProviderBuild || composerRoute.Capability != modeldomain.CapabilityResponses {
+		t.Fatalf("Build Composer route = %#v, err = %v", composerRoute, err)
 	}
 	// Web does not use Build normalization and still supports its catalog models.
 	webCandidates, err := accountRepo.ListRoutingCandidates(ctx, account.ProviderWeb, 0, "grok-imagine-video", "")
@@ -355,13 +392,14 @@ type buildCapabilityNormalizerAdapter struct {
 }
 
 func (a *buildCapabilityNormalizerAdapter) NormalizeAccountModelCapabilities(models []string, billing *account.Billing, credential account.Credential) []string {
-	// Match cli.Adapter rules: derive same-account compatibility and Super video entitlement. Ignore BuildAPIFallback.
+	// Match cli.Adapter rules: derive same-account compatibility and session-contract capabilities.
 	const (
 		video15 = "grok-imagine-video-1.5"
 		current = "grok-4.6"
 		legacy  = "grok-4.5"
 	)
 	super := account.IsBuildSuper(credential, billing)
+	composer := credential.Provider == account.ProviderBuild && credential.AuthType == account.AuthTypeOAuth
 	result := make([]string, 0, len(models)+2)
 	seen := make(map[string]struct{}, len(models)+2)
 	hasVideo15 := false
@@ -389,6 +427,11 @@ func (a *buildCapabilityNormalizerAdapter) NormalizeAccountModelCapabilities(mod
 	}
 	if super && !hasVideo15 {
 		result = append(result, video15)
+	}
+	if composer {
+		if _, exists := seen[modeldomain.GrokComposer25Fast]; !exists {
+			result = append(result, modeldomain.GrokComposer25Fast)
+		}
 	}
 	return result
 }
