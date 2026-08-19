@@ -449,7 +449,7 @@ func TestSyncQuotaCorrectsStoredSuperFromFreshWebQuota(t *testing.T) {
 
 func writeEmptyImagineQuota(writer http.ResponseWriter) {
 	writer.Header().Set("Content-Type", "application/json")
-	_, _ = writer.Write([]byte(`{"image":null,"imageEdit":null,"imagePro":null,"video":null,"video720p":null}`))
+	_, _ = writer.Write([]byte(`{"image":null,"imageEdit":null,"imagePro":{},"video":null,"video720p":null}`))
 }
 
 func TestDecodeImagineQuotaSnapshotMatchesObservedProtocol(t *testing.T) {
@@ -493,6 +493,19 @@ func TestDecodeImagineQuotaSnapshotAcceptsExplicitUnavailableProduct(t *testing.
 		t.Fatal(err)
 	}
 	if len(windows) != 1 || windows[0].Mode != account.QuotaModeWebImageEdit || windows[0].Remaining != 0 || windows[0].ResetAt == nil {
+		t.Fatalf("windows = %#v", windows)
+	}
+}
+
+func TestDecodeImagineQuotaSnapshotAcceptsEmptyUnavailableProduct(t *testing.T) {
+	now := time.Now().UTC()
+	windows, err := decodeImagineQuotaSnapshot([]byte(`{
+		"image":null,"imageEdit":null,"imagePro":{ },"video":null,"video720p":null
+	}`), 42, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(windows) != 0 {
 		t.Fatalf("windows = %#v", windows)
 	}
 }

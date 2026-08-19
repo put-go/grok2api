@@ -172,6 +172,11 @@ func decodeImagineQuotaSnapshot(body []byte, accountID uint64, now time.Time) ([
 		if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
 			continue
 		}
+		// Downgraded accounts may expose unavailable products as an empty object.
+		var object map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &object); err == nil && object != nil && len(object) == 0 {
+			continue
+		}
 		var product imagineQuotaProduct
 		if err := json.Unmarshal(raw, &product); err != nil {
 			return nil, fmt.Errorf("解析 Grok Web Imagine 配额字段 %s: %w", item.field, err)
