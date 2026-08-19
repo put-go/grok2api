@@ -191,8 +191,12 @@ func segmentedCandidateCohorts(values []account.RoutingCandidate, indexes []int,
 	cohortFor := func(index int) segmentedSelectorCohort {
 		candidate := values[index]
 		tierRank, _ := tierGroups.Rank(candidate.Credential.WebTier)
+		supportsModel, capabilityKnown := candidate.SupportsModel, candidate.ModelCapabilityKnown
+		if candidate.Credential.Provider == account.ProviderWeb && len(tierGroups) > 0 && tierAllowed(tierGroups, candidate.Credential.WebTier) {
+			supportsModel, capabilityKnown = true, true
+		}
 		cohort := segmentedSelectorCohort{
-			supportsModel: candidate.SupportsModel, capabilityKnown: candidate.ModelCapabilityKnown,
+			supportsModel: supportsModel, capabilityKnown: capabilityKnown,
 			preferFreeBuild: preferFreeBuild && candidate.IsKnownFreeBuild(),
 			tier:            tierRank, priority: candidate.Credential.Priority,
 		}
@@ -298,6 +302,11 @@ func segmentedCandidateCohorts(values []account.RoutingCandidate, indexes []int,
 		}
 	}
 	return result
+}
+
+func tierAllowed(groups account.WebTierGroups, tier account.WebTier) bool {
+	_, allowed := groups.Rank(tier)
+	return allowed
 }
 
 func segmentedActiveSelectionStage(cohortIndex, windowOffset int) string {

@@ -56,6 +56,26 @@ export type QualityGuardStatistics = {
   actions: { quarantined: number; restored: number; suppressed: number };
 };
 
+export type ProbeProfileSummary = {
+  id: string;
+  name: string;
+  built_in: boolean;
+  match_mode: string;
+  has_expected: boolean;
+  require_thinking: boolean;
+};
+
+export type ProbeProfile = {
+  id: string;
+  name: string;
+  built_in: boolean;
+  prompt: string;
+  expected_text?: string;
+  match_mode: string;
+  require_thinking: boolean;
+  max_output_tokens?: number;
+};
+
 export type QualityGuardStatus = {
   available: boolean;
   editable?: boolean;
@@ -63,6 +83,8 @@ export type QualityGuardStatus = {
   updatedAt?: number;
   lastActiveCycleAt?: number;
   lastPassivePollAt?: number;
+  activeProfileId?: string;
+  profiles?: ProbeProfileSummary[];
   config?: {
     mode: "active" | "passive" | "hybrid";
     model: string;
@@ -91,9 +113,12 @@ export type QualityTestResult = {
   firstTokenMs: number;
   durationMs: number;
   outputTokens: number;
+  reasoningTokens: number;
   visibleTokens: number;
   outputTokensPerSecond: number;
+  generationMs: number;
   expectedMatched: boolean;
+  thinkingRequired: boolean;
 };
 
 const nodeStateValidator = hasShape({
@@ -131,7 +156,12 @@ const decodeStatus = (value: unknown): QualityGuardStatus => {
   }
   return createObjectDecoder<QualityGuardStatus>("quality guard", {
     available: isBoolean, editable: isOptional(isBoolean), startedAt: isNumber, updatedAt: isNumber, lastActiveCycleAt: isNumber,
-    lastPassivePollAt: isNumber, config: configValidator, nodes: isRecordOf(nodeStateValidator),
+    lastPassivePollAt: isNumber, activeProfileId: isOptional(isString),
+    profiles: isOptional(isArrayOf(hasShape({
+      id: isString, name: isString, built_in: isBoolean, match_mode: isString, has_expected: isBoolean,
+      require_thinking: isBoolean,
+    }))),
+    config: configValidator, nodes: isRecordOf(nodeStateValidator),
     protectedNodeIds: isOptional(isArrayOf(isString)),
     recentEvents: isArrayOf(eventValidator), statistics: isOptional(statisticsValidator),
   })(value);
@@ -139,16 +169,50 @@ const decodeStatus = (value: unknown): QualityGuardStatus => {
 
 const decodeQualityTest = createObjectDecoder<QualityTestResult>("quality test", {
   nodeId: isString, statusCode: isNumber, firstTokenMs: isNumber, durationMs: isNumber,
-  outputTokens: isNumber, visibleTokens: isNumber, outputTokensPerSecond: isNumber, expectedMatched: isBoolean,
+  outputTokens: isNumber, reasoningTokens: isNumber, visibleTokens: isNumber,
+  outputTokensPerSecond: isNumber, generationMs: isNumber, expectedMatched: isBoolean,
+  thinkingRequired: isBoolean,
 });
 
 export function getQualityGuardStatus(): Promise<QualityGuardStatus> {
   return apiRequest("/api/admin/v1/egress-quality-guard", {}, decodeStatus);
 }
 
-export function runQualityTest(nodeId: string, status: QualityGuardStatus): Promise<QualityTestResult> {
+export function runQualityTest(nodeId: string, status: QualityGuardStatus, profileId?: string): Promise<QualityTestResult> {
   if (!status.config) throw new Error("Quality guard configuration is unavailable");
-  return apiRequest(`/api/admin/v1/egress-quality-guard/nodes/${nodeId}/test`, { method: "POST" }, decodeQualityTest);
+  return apiRequest(`/api/admin/v1/egress-quality-guard/nodes/${nodeId}/test`, {
+    method: "POST",
+    body: profileId ? { profileId } : {},
+  }, decodeQualityTest);
+}
+
+const decodeProfile = createObjectDecoder<ProbeProfile>("probe profile", {
+  id: isString, name: isString, built_in: isBoolean, prompt: isString,
+  expected_text: isOptional(isString), match_mode: isString, require_thinking: isBoolean,
+  max_output_tokens: isOptional(isNumber),
+});
+
+export function listProbeProfiles(): Promise<{ activeProfileId: string; items: ProbeProfile[] }> {
+  return apiRequest("/api/admin/v1/egress-quality-guard/profiles", {}, createObjectDecoder("probe profiles", {
+    activeProfileId: isString,
+    items: isArrayOf(hasShape({
+      id: isString, name: isString, built_in: isBoolean, prompt: isString,
+      expected_text: isOptional(isString), match_mode: isString, require_thinking: isBoolean,
+      max_output_tokens: isOptional(isNumber),
+    })),
+  }));
+}
+
+export function createProbeProfile(input: { name: string; prompt: string; expectedText?: string; matchMode: string; requireThinking?: boolean; active?: boolean }): Promise<ProbeProfile> {
+  return apiRequest("/api/admin/v1/egress-quality-guard/profiles", { method: "POST", body: input }, decodeProfile);
+}
+
+export function updateProbeProfile(id: string, input: { name: string; prompt: string; expectedText?: string; matchMode: string; requireThinking?: boolean; active?: boolean }): Promise<ProbeProfile> {
+  return apiRequest(`/api/admin/v1/egress-quality-guard/profiles/${id}`, { method: "PUT", body: input }, decodeProfile);
+}
+
+export function deleteProbeProfile(id: string): Promise<{ deleted: boolean }> {
+  return apiRequest(`/api/admin/v1/egress-quality-guard/profiles/${id}`, { method: "DELETE" }, createObjectDecoder("delete profile", { deleted: isBoolean }));
 }
 
 export function updateQualityGuardPolicy(policy: QualityGuardPolicy): Promise<{ saved: boolean }> {
@@ -156,7 +220,7 @@ export function updateQualityGuardPolicy(policy: QualityGuardPolicy): Promise<{ 
 }
 
 export type DegradeWindow = "1h" | "6h" | "24h" | "7d";
-export type DegradeClass = "buffered_burst" | "soft_tps" | "hard_tps";
+export type DegradeClass = "buffered_burst" | "soft_tps" | "hard_tps" | "missing_thinking";
 
 export type DegradeAccountDTO = {
   id: string;
@@ -189,7 +253,7 @@ export type DegradeSummaryDTO = {
   window: DegradeWindow;
   generatedAt: string;
   thresholds: { softTPS: number; hardTPS: number; minGenMs: number; minOutputTokens: number };
-  totals: { hits: number; accounts: number; stillEnabled: number; disabled: number; deleted: number; hard: number; soft: number; burst: number; maxTPS: number };
+  totals: { hits: number; accounts: number; stillEnabled: number; disabled: number; deleted: number; hard: number; soft: number; burst: number; thinking: number; maxTPS: number };
   series: { label: string; count: number; severe: number }[];
   nodes: { name: string; hits: number; accounts: number; maxTPS: number }[];
   accounts: DegradeAccountDTO[];
@@ -197,13 +261,13 @@ export type DegradeSummaryDTO = {
   events: DegradeEventDTO[];
 };
 
-const degradeClassValidator = isOneOf("buffered_burst", "soft_tps", "hard_tps");
+const degradeClassValidator = isOneOf("buffered_burst", "soft_tps", "hard_tps", "missing_thinking");
 
 const decodeDegradeSummary = createObjectDecoder<DegradeSummaryDTO>("degrade accounts", {
   window: isOneOf("1h", "6h", "24h", "7d"),
   generatedAt: isString,
   thresholds: hasShape({ softTPS: isNumber, hardTPS: isNumber, minGenMs: isNumber, minOutputTokens: isNumber }),
-  totals: hasShape({ hits: isNumber, accounts: isNumber, stillEnabled: isNumber, disabled: isNumber, deleted: isNumber, hard: isNumber, soft: isNumber, burst: isNumber, maxTPS: isNumber }),
+  totals: hasShape({ hits: isNumber, accounts: isNumber, stillEnabled: isNumber, disabled: isNumber, deleted: isNumber, hard: isNumber, soft: isNumber, burst: isNumber, thinking: isNumber, maxTPS: isNumber }),
   series: isArrayOf(hasShape({ label: isString, count: isNumber, severe: isNumber })),
   nodes: isArrayOf(hasShape({ name: isString, hits: isNumber, accounts: isNumber, maxTPS: isNumber })),
   accounts: isArrayOf(hasShape({

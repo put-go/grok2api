@@ -263,6 +263,27 @@ func TestSegmentedCandidateCohortsPoolSuperAndHeavy(t *testing.T) {
 	}
 }
 
+func TestSegmentedCohortsUseEffectiveWebCatalogCapability(t *testing.T) {
+	values := []account.RoutingCandidate{
+		{
+			Credential:           account.Credential{ID: 1, Provider: account.ProviderWeb, WebTier: account.WebTierBasic},
+			ModelCapabilityKnown: true,
+			SupportsModel:        false, // stale snapshot from before Basic support
+		},
+		{
+			Credential:           account.Credential{ID: 2, Provider: account.ProviderWeb, WebTier: account.WebTierSuper},
+			ModelCapabilityKnown: true,
+			SupportsModel:        true,
+		},
+	}
+	cohorts := segmentedCandidateCohorts(values, nil, time.Now().UTC(), account.WebTierGroups{
+		{account.WebTierBasic}, {account.WebTierSuper, account.WebTierHeavy},
+	}, false, 0, 1, 2)
+	if len(cohorts) != 2 || len(cohorts[0].indexes) != 1 || cohorts[0].indexes[0] != 0 {
+		t.Fatalf("segmented Web cohorts = %#v, want Basic account first", cohorts)
+	}
+}
+
 func TestSegmentedPlannerUsesOnePreferFreeBuildSnapshot(t *testing.T) {
 	now := time.Now().UTC()
 	values := []account.RoutingCandidate{
