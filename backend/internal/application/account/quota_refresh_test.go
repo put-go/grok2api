@@ -411,6 +411,50 @@ func TestRefreshWebImagineQuotaModeAtomicallyReplacesGroup(t *testing.T) {
 	}
 }
 
+func TestRefreshPaidWebImagineQuotaModeMigratesGroupToWeekly(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "imagine-shared-weekly.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	accounts := relational.NewAccountRepository(database)
+	credential, _, err := accounts.UpsertByIdentity(ctx, accountdomain.Credential{
+		Provider: accountdomain.ProviderWeb, AuthType: accountdomain.AuthTypeSSO, WebTier: accountdomain.WebTierSuper,
+		Name: "web-shared-weekly", SourceKey: "web-shared-weekly", EncryptedAccessToken: "encrypted",
+		Enabled: true, AuthStatus: accountdomain.AuthStatusActive,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if err := accounts.SaveQuotaWindows(ctx, credential.ID, accountdomain.WebTierSuper, now, []accountdomain.QuotaWindow{
+		{AccountID: credential.ID, Mode: accountdomain.QuotaModeWebImagePro, Remaining: 4, UpdatedAt: now},
+		{AccountID: credential.ID, Mode: accountdomain.QuotaModeWebVideo720p, Remaining: 1, UpdatedAt: now},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	adapter := &sharedWeeklyQuotaGroupAdapter{}
+	service := NewService(accounts, nil, nil, nil, provider.NewRegistry(adapter), nil, nil)
+	window, err := service.RefreshQuotaMode(ctx, credential.ID, accountdomain.QuotaModeWebImagePro)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if window.Mode != "weekly" || window.Remaining != 6800 || adapter.calls.Load() != 1 {
+		t.Fatalf("window = %#v, calls = %d", window, adapter.calls.Load())
+	}
+	stored, err := accounts.GetQuotaWindows(ctx, []uint64{credential.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stored[credential.ID]) != 1 || stored[credential.ID][0].Mode != "weekly" || stored[credential.ID][0].Remaining != 6800 {
+		t.Fatalf("stored = %#v", stored[credential.ID])
+	}
+}
+
 func TestRefreshConsoleQuotaModePersistsCompleteUsageSnapshot(t *testing.T) {
 	ctx := context.Background()
 	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "console-quota-mode.db"))
@@ -900,6 +944,10 @@ type imagineQuotaGroupAdapter struct {
 	calls atomic.Int64
 }
 
+type sharedWeeklyQuotaGroupAdapter struct {
+	calls atomic.Int64
+}
+
 func (a *imagineQuotaGroupAdapter) Provider() accountdomain.Provider {
 	return accountdomain.ProviderWeb
 }
@@ -922,6 +970,33 @@ func (a *imagineQuotaGroupAdapter) SyncQuotaGroup(_ context.Context, credential 
 		Windows: []accountdomain.QuotaWindow{{
 			AccountID: credential.ID, Mode: accountdomain.QuotaModeWebImagePro, Remaining: 3,
 			WindowSeconds: 86400, SyncedAt: &now, Source: accountdomain.QuotaSourceUpstream, UpdatedAt: now,
+		}},
+	}, nil
+}
+
+func (a *sharedWeeklyQuotaGroupAdapter) Provider() accountdomain.Provider {
+	return accountdomain.ProviderWeb
+}
+
+func (a *sharedWeeklyQuotaGroupAdapter) Definition() provider.Definition {
+	return provider.Definition{
+		Provider: accountdomain.ProviderWeb, ModelNamespace: accountdomain.ProviderWeb.ModelNamespace(),
+		Quota: provider.QuotaRemoteWindow, Credential: provider.CredentialSurface{AuthType: accountdomain.AuthTypeSSO},
+	}
+}
+
+func (a *sharedWeeklyQuotaGroupAdapter) SyncQuotaGroup(_ context.Context, credential accountdomain.Credential, group string) (provider.QuotaGroupSnapshot, error) {
+	a.calls.Add(1)
+	if group != accountdomain.QuotaGroupWebImagine {
+		return provider.QuotaGroupSnapshot{}, errors.New("unexpected group")
+	}
+	now := time.Now().UTC()
+	modes := append([]string{"weekly"}, accountdomain.WebImagineQuotaModes()...)
+	return provider.QuotaGroupSnapshot{
+		Group: group, Modes: modes, SyncedAt: now,
+		Windows: []accountdomain.QuotaWindow{{
+			AccountID: credential.ID, Mode: "weekly", Remaining: 6800, Total: 10000, UsagePercent: 32,
+			WindowSeconds: 7 * 24 * 60 * 60, SyncedAt: &now, Source: accountdomain.QuotaSourceUpstream, UpdatedAt: now,
 		}},
 	}, nil
 }

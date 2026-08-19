@@ -69,7 +69,7 @@ func TestRoutingProjectionLeavesSecretsAndLargeJSONOutOfCandidateLoad(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(imagineBases) != 1 || imagineBases[0].QuotaWindow == nil || imagineBases[0].QuotaWindow.Mode != account.QuotaModeWebImagePro || imagineBases[0].QuotaWindow.Remaining != 3 {
+	if len(imagineBases) != 1 || imagineBases[0].QuotaWindow == nil || imagineBases[0].QuotaWindow.Mode != "weekly" || imagineBases[0].QuotaWindow.Remaining != 10 {
 		t.Fatalf("Imagine routing quota = %#v", imagineBases)
 	}
 

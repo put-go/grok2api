@@ -3038,6 +3038,11 @@ func (s *Service) RefreshQuotaMode(ctx context.Context, id uint64, mode string) 
 		}
 	}
 	window, ok := quotaWindowByMode(refreshed.Windows, mode)
+	if !ok && isWebImagineQuotaMode(mode) {
+		// Paid Web Imagine products share the Usage-page weekly pool. A group
+		// refresh returns that canonical window while removing legacy aliases.
+		window, ok = quotaWindowByMode(refreshed.Windows, "weekly")
+	}
 	if !ok {
 		return accountdomain.QuotaWindow{}, fmt.Errorf("Provider usage 响应缺少 %s 额度", mode)
 	}
@@ -3076,6 +3081,9 @@ func (s *Service) ProbeQuotaMode(ctx context.Context, id uint64, mode string) (a
 		return accountdomain.QuotaWindow{}, fmt.Errorf("Provider 模式额度探测返回类型无效")
 	}
 	window, ok := quotaWindowByMode(refreshed.Windows, mode)
+	if !ok && isWebImagineQuotaMode(mode) {
+		window, ok = quotaWindowByMode(refreshed.Windows, "weekly")
+	}
 	if !ok {
 		return accountdomain.QuotaWindow{}, fmt.Errorf("Provider usage 响应缺少 %s 额度", mode)
 	}

@@ -116,9 +116,9 @@ func (a *Adapter) QuotaMode(upstreamModel string) string {
 }
 
 func (a *Adapter) QuotaRefreshGroup(upstreamModel string) string {
-	if spec, ok := Resolve(upstreamModel); ok && account.IsWebImagineQuotaMode(spec.Mode) {
-		return account.QuotaGroupWebImagine
-	}
+	// Paid Web media routes select the shared weekly Usage window. Returning no
+	// fixed group lets finalization refresh that effective window. Basic routes
+	// still carry a product mode, which QueueQuotaRefresh maps to web_imagine.
 	return ""
 }
 

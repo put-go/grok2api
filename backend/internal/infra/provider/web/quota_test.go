@@ -25,6 +25,8 @@ import (
 
 const capturedWeeklyCreditsHex = "00000000630a610d0000304112001a00220c089abbccd2061080f2d1fc012a0c089ab0f1d2061080f2d1fc013a07080515000020413a070804150000803f3a020802421e0802120c089abbccd2061080f2d1fc011a0c089ab0f1d2061080f2d1fc01580162006801800000000f677270632d7374617475733a300d0a"
 
+const capturedSharedUsageHex = "000000005a0a580d0000004212001a00220c08e4e589d40610e8bfebde012a0c08e4daaed40610e8bfebde013a07080515000000423a020804421e0802120c08e4e589d40610e8bfebde011a0c08e4daaed40610e8bfebde01580162006801800000000f677270632d7374617475733a300d0a"
+
 func TestParseCapturedWeeklyCreditsResponse(t *testing.T) {
 	body, err := hex.DecodeString(capturedWeeklyCreditsHex)
 	if err != nil {
@@ -42,6 +44,27 @@ func TestParseCapturedWeeklyCreditsResponse(t *testing.T) {
 		t.Fatalf("usage/reset = %#v", window)
 	}
 	if len(window.Breakdown) != 3 || window.Breakdown[0].ProductCode != account.QuotaProductImagine || window.Breakdown[0].UsagePercent != 10 || window.Breakdown[1].ProductCode != account.QuotaProductChat || window.Breakdown[1].UsagePercent != 1 || window.Breakdown[2].ProductCode != account.QuotaProductBuild || window.Breakdown[2].UsagePercent != 0 {
+		t.Fatalf("breakdown = %#v", window.Breakdown)
+	}
+}
+
+func TestParseCapturedSharedUsageResponse(t *testing.T) {
+	body, err := hex.DecodeString(capturedSharedUsageHex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	syncedAt := time.Date(2026, 8, 19, 0, 0, 0, 0, time.UTC)
+	window, err := parseWeeklyCreditsResponse(body, 42, syncedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if window.Mode != weeklyQuotaMode || window.Total != 10000 || window.Remaining != 6800 || window.WindowSeconds != 7*24*60*60 {
+		t.Fatalf("window = %#v", window)
+	}
+	if math.Abs(window.UsagePercent-32) > 0.001 || window.ResetAt == nil || window.ResetAt.Unix() != 1787538788 || window.ResetAt.Nanosecond() != 467329000 {
+		t.Fatalf("usage/reset = %#v", window)
+	}
+	if len(window.Breakdown) != 2 || window.Breakdown[0].ProductCode != account.QuotaProductImagine || window.Breakdown[0].UsagePercent != 32 || window.Breakdown[1].ProductCode != account.QuotaProductChat || window.Breakdown[1].UsagePercent != 0 {
 		t.Fatalf("breakdown = %#v", window.Breakdown)
 	}
 }
@@ -76,9 +99,11 @@ func TestSyncQuotaFetchesWeeklyOnlyAfterPaidTierIsConfirmed(t *testing.T) {
 		t.Fatal(err)
 	}
 	var weeklyCalls atomic.Int64
+	var imagineCalls atomic.Int64
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		switch request.URL.Path {
 		case "/rest/media/imagine/quota_info":
+			imagineCalls.Add(1)
 			writeEmptyImagineQuota(writer)
 		case "/grok_api_v2.GrokBuildBilling/GetGrokCreditsConfig":
 			weeklyCalls.Add(1)
@@ -116,8 +141,15 @@ func TestSyncQuotaFetchesWeeklyOnlyAfterPaidTierIsConfirmed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if snapshot.Tier != account.WebTierSuper || len(snapshot.Windows) != 1 || snapshot.Windows[0].Mode != weeklyQuotaMode || weeklyCalls.Load() != 1 {
-		t.Fatalf("snapshot = %#v, weekly calls = %d", snapshot, weeklyCalls.Load())
+	if snapshot.Tier != account.WebTierSuper || len(snapshot.Windows) != 1 || snapshot.Windows[0].Mode != weeklyQuotaMode || weeklyCalls.Load() != 1 || imagineCalls.Load() != 0 {
+		t.Fatalf("snapshot = %#v, weekly calls = %d, Imagine calls = %d", snapshot, weeklyCalls.Load(), imagineCalls.Load())
+	}
+	group, err := adapter.SyncQuotaGroup(context.Background(), account.Credential{ID: 2, WebTier: account.WebTierSuper, EncryptedAccessToken: encrypted}, account.QuotaGroupWebImagine)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(group.Windows) != 1 || group.Windows[0].Mode != weeklyQuotaMode || len(group.Modes) != 1+len(account.WebImagineQuotaModes()) || group.Modes[0] != weeklyQuotaMode || weeklyCalls.Load() != 2 || imagineCalls.Load() != 0 {
+		t.Fatalf("group = %#v, weekly calls = %d, Imagine calls = %d", group, weeklyCalls.Load(), imagineCalls.Load())
 	}
 }
 

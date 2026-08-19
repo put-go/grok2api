@@ -36,41 +36,41 @@ func (a *Adapter) SyncQuota(ctx context.Context, credential account.Credential) 
 	if fastErr == nil {
 		chatWindows = append(chatWindows, fastWindow)
 	}
-	imagineSnapshot, imagineErr := a.SyncQuotaGroup(ctx, credential, account.QuotaGroupWebImagine)
-	if imagineErr != nil {
-		// A full refresh replaces every stored window. Never return a partial
-		// snapshot, otherwise a transient Imagine failure would erase the last
-		// known authoritative media quotas.
-		return provider.QuotaSnapshot{}, imagineErr
-	}
 	if len(chatWindows) > 0 {
 		tier, _ := resolveWebTierFromQuota(credential.WebTier, chatWindows, false)
-		var windows []account.QuotaWindow
-		// Basic/未知账号没有付费周池，避免为每次完整同步额外访问付费端点。
-		// 只有模式额度已经确认付费等级时才读取 weekly 作为权威额度。
+		// The Usage page exposes one shared weekly pool for paid Chat and
+		// Imagine products. Do not also persist per-product media windows: their
+		// contribution percentages are a breakdown of this pool, not independent
+		// limits.
 		if tier == account.WebTierSuper || tier == account.WebTierHeavy {
-			if weekly, weeklyErr := a.syncWeeklyCredits(ctx, credential); weeklyErr == nil {
-				// 周池覆盖 chat 模式窗口，但保留 imagine 窗口供前端展示与触顶判定。
-				kept := make([]account.QuotaWindow, 0, 1+len(imagineSnapshot.Windows))
-				kept = append(kept, weekly)
-				kept = append(kept, imagineSnapshot.Windows...)
-				windows = kept
+			weekly, weeklyErr := a.syncWeeklyCredits(ctx, credential)
+			if weeklyErr != nil {
+				return provider.QuotaSnapshot{}, weeklyErr
 			}
+			return provider.QuotaSnapshot{Tier: tier, Windows: []account.QuotaWindow{weekly}, SyncedAt: time.Now().UTC()}, nil
 		}
-		if windows == nil {
-			windows = append(chatWindows, imagineSnapshot.Windows...)
+		resolvedCredential := credential
+		resolvedCredential.WebTier = tier
+		imagineSnapshot, imagineErr := a.SyncQuotaGroup(ctx, resolvedCredential, account.QuotaGroupWebImagine)
+		if imagineErr != nil {
+			return provider.QuotaSnapshot{}, imagineErr
 		}
+		windows := append(chatWindows, imagineSnapshot.Windows...)
 		return provider.QuotaSnapshot{Tier: tier, Windows: windows, SyncedAt: time.Now().UTC()}, nil
 	}
 	// 模式端点暂不可用时，仅已确认的付费账号允许用 weekly 兜底；
 	// Basic/Auto 不能凭周额度探测提权，也不应制造无意义的付费端点流量。
 	if credential.WebTier == account.WebTierSuper || credential.WebTier == account.WebTierHeavy {
 		if weekly, weeklyErr := a.syncWeeklyCredits(ctx, credential); weeklyErr == nil {
-			kept := append([]account.QuotaWindow{weekly}, imagineSnapshot.Windows...)
-			return provider.QuotaSnapshot{Tier: credential.WebTier, Windows: kept, SyncedAt: time.Now().UTC()}, nil
+			return provider.QuotaSnapshot{Tier: credential.WebTier, Windows: []account.QuotaWindow{weekly}, SyncedAt: time.Now().UTC()}, nil
 		} else {
 			return provider.QuotaSnapshot{}, weeklyErr
 		}
+	}
+	// Basic and unresolved accounts have no precise shared Usage percentage.
+	// Keep the legacy product endpoint as their authoritative quota source.
+	if _, imagineErr := a.SyncQuotaGroup(ctx, credential, account.QuotaGroupWebImagine); imagineErr != nil {
+		return provider.QuotaSnapshot{}, imagineErr
 	}
 	if fastErr != nil {
 		return provider.QuotaSnapshot{}, fastErr
@@ -78,13 +78,22 @@ func (a *Adapter) SyncQuota(ctx context.Context, credential account.Credential) 
 	return provider.QuotaSnapshot{}, autoErr
 }
 
-// SyncQuotaGroup refreshes the authoritative Web Imagine quota group. The
-// upstream endpoint returns every media product in one response, so callers
-// must persist the snapshot atomically instead of treating its fields as four
-// independent requests.
+// SyncQuotaGroup keeps the legacy group contract used by Basic accounts and
+// in-flight refresh jobs. Paid accounts migrate the whole group to the shared
+// Usage-page weekly pool and atomically remove obsolete product windows.
 func (a *Adapter) SyncQuotaGroup(ctx context.Context, credential account.Credential, group string) (provider.QuotaGroupSnapshot, error) {
 	if group != account.QuotaGroupWebImagine {
 		return provider.QuotaGroupSnapshot{}, fmt.Errorf("unsupported Web quota group %q", group)
+	}
+	if credential.WebTier == account.WebTierSuper || credential.WebTier == account.WebTierHeavy {
+		weekly, err := a.syncWeeklyCredits(ctx, credential)
+		if err != nil {
+			return provider.QuotaGroupSnapshot{}, err
+		}
+		modes := append([]string{weeklyQuotaMode}, account.WebImagineQuotaModes()...)
+		return provider.QuotaGroupSnapshot{
+			Group: group, Modes: modes, Windows: []account.QuotaWindow{weekly}, SyncedAt: time.Now().UTC(),
+		}, nil
 	}
 	cfg := a.config()
 	token, err := a.cipher.Decrypt(credential.EncryptedAccessToken)

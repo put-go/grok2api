@@ -643,11 +643,11 @@ func (r *AccountRepository) getRoutingQuotaWindows(ctx context.Context, provider
 	if provider != account.ProviderWeb && quotaMode == "" {
 		return result, nil
 	}
-	modes := make([]string, 0, 2)
-	// Paid Web chat routes are governed by the shared weekly pool. Imagine
-	// products have independent authoritative windows and must not be hidden by
-	// a weekly row merely because the same account also has paid chat access.
-	if provider == account.ProviderWeb && !account.IsWebImagineQuotaMode(quotaMode) {
+	modes := make([]string, 0, 3)
+	// Paid Web Chat and Imagine products consume the shared Usage-page weekly
+	// pool. Basic accounts do not have a precise weekly row and continue to use
+	// their product-specific windows below.
+	if provider == account.ProviderWeb {
 		modes = append(modes, "weekly")
 	}
 	if provider == account.ProviderWeb && quotaMode == account.QuotaModeWebImageEdit {
