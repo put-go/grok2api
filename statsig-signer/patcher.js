@@ -1,4 +1,5 @@
-import { parse } from "parse5";
+import { parse as parseJavaScript } from "acorn";
+import { parse as parseHTML } from "parse5";
 
 const identifier = String.raw`[A-Za-z_$][\w$]*`;
 
@@ -42,22 +43,305 @@ export function patchStatsigChunk(source) {
   }
 
   const factoryMatch = cachedFactorySignerPattern.exec(source);
-  if (!factoryMatch) {
+  if (factoryMatch) {
+    const nextVariable = factoryMatch[10];
+    const declaration = factoryMatch[0].slice(0, -(`,${nextVariable}=`.length));
+    const replacement = `${declaration};globalThis.__grok2apiStatsigSign=${factoryMatch[1]};let ${nextVariable}=`;
+    return {
+      patched: true,
+      source:
+        source.slice(0, factoryMatch.index) +
+        replacement +
+        source.slice(factoryMatch.index + factoryMatch[0].length),
+      functionName: factoryMatch[1],
+      loaderModuleID: factoryMatch[4],
+    };
+  }
+
+  const structuralMatch = findStructuralSignerWrapper(source);
+  if (!structuralMatch) {
     return { patched: false, source };
   }
 
-  const nextVariable = factoryMatch[10];
-  const declaration = factoryMatch[0].slice(0, -(`,${nextVariable}=`.length));
-  const replacement = `${declaration};globalThis.__grok2apiStatsigSign=${factoryMatch[1]};let ${nextVariable}=`;
+  const assignment = "globalThis.__grok2apiStatsigSign=";
+  if (structuralMatch.declarationName) {
+    const insertionIndex = structuralMatch.end;
+    return {
+      patched: true,
+      source:
+        source.slice(0, insertionIndex) +
+        `;${assignment}${structuralMatch.declarationName};` +
+        source.slice(insertionIndex),
+      functionName: structuralMatch.declarationName,
+      loaderModuleID: structuralMatch.loaderModuleID,
+    };
+  }
+
   return {
     patched: true,
     source:
-      source.slice(0, factoryMatch.index) +
-      replacement +
-      source.slice(factoryMatch.index + factoryMatch[0].length),
-    functionName: factoryMatch[1],
-    loaderModuleID: factoryMatch[4],
+      source.slice(0, structuralMatch.start) +
+      assignment +
+      source.slice(structuralMatch.start),
+    functionName: structuralMatch.functionName,
+    loaderModuleID: structuralMatch.loaderModuleID,
   };
+}
+
+function findStructuralSignerWrapper(source) {
+  const syntaxTree = parseChunk(source);
+  if (!syntaxTree) {
+    return undefined;
+  }
+
+  const candidates = [];
+  walkSyntax(syntaxTree, [], (node, ancestors) => {
+    if (!isAsyncTwoArgumentFunction(node)) {
+      return;
+    }
+    const firstParameter = node.params[0].name;
+    const secondParameter = node.params[1].name;
+    if (!returnsSignerCall(node.body, firstParameter, secondParameter)) {
+      return;
+    }
+
+    const contextNode = findWrapperContext(node, ancestors);
+    const loader = findSignerLoader(contextNode, node.start);
+    if (!loader) {
+      return;
+    }
+    const context = source.slice(contextNode.start, contextNode.end);
+    let score = loader.index >= node.start ? 4 : 2;
+    if (/\?\?=|\|\|=|\.catch\(|new Promise\(/.test(context)) {
+      score += 1;
+    }
+    if (containsAwaitOutsideNestedFunction(node.body)) {
+      score += 1;
+    }
+
+    const declarationName = node.type === "FunctionDeclaration" ? node.id?.name ?? "" : "";
+    candidates.push({
+      start: node.start,
+      end: node.end,
+      declarationName,
+      functionName: declarationName || inferFunctionName(node, ancestors) || "anonymous",
+      loaderModuleID: loader.moduleID,
+      score,
+    });
+  });
+
+  candidates.sort((left, right) => right.score - left.score);
+  if (candidates.length === 0 || (candidates.length > 1 && candidates[0].score === candidates[1].score)) {
+    return undefined;
+  }
+  return candidates[0];
+}
+
+function parseChunk(source) {
+  for (const sourceType of ["script", "module"]) {
+    try {
+      return parseJavaScript(source, {
+        ecmaVersion: "latest",
+        sourceType,
+        allowAwaitOutsideFunction: true,
+        allowReturnOutsideFunction: sourceType === "script",
+      });
+    } catch {
+      // Try the other source type before treating this chunk as unsupported.
+    }
+  }
+  return undefined;
+}
+
+function isAsyncTwoArgumentFunction(node) {
+  return (
+    (node.type === "FunctionDeclaration" ||
+      node.type === "FunctionExpression" ||
+      node.type === "ArrowFunctionExpression") &&
+    node.async === true &&
+    node.body?.type === "BlockStatement" &&
+    node.params?.length === 2 &&
+    node.params.every((parameter) => parameter.type === "Identifier")
+  );
+}
+
+function returnsSignerCall(body, firstParameter, secondParameter) {
+  let found = false;
+  walkFunctionBody(body, (node) => {
+    if (node.type !== "ReturnStatement") {
+      return;
+    }
+    const value = unwrapAwait(node.argument);
+    if (
+      value?.type === "CallExpression" &&
+      value.callee?.type === "Identifier" &&
+      value.arguments?.length === 2 &&
+      value.arguments[0]?.type === "Identifier" &&
+      value.arguments[0].name === firstParameter &&
+      value.arguments[1]?.type === "Identifier" &&
+      value.arguments[1].name === secondParameter
+    ) {
+      found = true;
+    }
+  });
+  return found;
+}
+
+function containsAwaitOutsideNestedFunction(body) {
+  let found = false;
+  walkFunctionBody(body, (node) => {
+    if (node.type === "AwaitExpression") {
+      found = true;
+    }
+  });
+  return found;
+}
+
+function unwrapAwait(node) {
+  let value = node;
+  while (value?.type === "AwaitExpression" || value?.type === "ChainExpression") {
+    value = value.argument ?? value.expression;
+  }
+  return value;
+}
+
+function findWrapperContext(node, ancestors) {
+  for (let index = ancestors.length - 1; index >= 0; index -= 1) {
+    if (ancestors[index].type === "VariableDeclarator") {
+      return ancestors[index];
+    }
+  }
+  for (let index = ancestors.length - 1; index >= 0; index -= 1) {
+    if (ancestors[index].type === "AssignmentExpression") {
+      return ancestors[index];
+    }
+  }
+  return node;
+}
+
+function inferFunctionName(node, ancestors) {
+  if (node.id?.type === "Identifier") {
+    return node.id.name;
+  }
+  for (let index = ancestors.length - 1; index >= 0; index -= 1) {
+    const ancestor = ancestors[index];
+    if (ancestor.type === "VariableDeclarator" && ancestor.id?.type === "Identifier") {
+      return ancestor.id.name;
+    }
+    if (ancestor.type === "AssignmentExpression" && ancestor.left?.type === "Identifier") {
+      return ancestor.left.name;
+    }
+  }
+  return "";
+}
+
+function findSignerLoader(contextNode, wrapperStart) {
+  const loaders = [];
+  const defaultExports = [];
+  walkSyntax(contextNode, [], (node, ancestors) => {
+    if (isDefaultExportAccess(node)) {
+      defaultExports.push(node);
+    }
+    const loader = parseLoaderCall(node, ancestors);
+    if (loader) {
+      loaders.push(loader);
+    }
+  });
+
+  let nearest;
+  for (const loader of loaders) {
+    const defaultDistance = defaultExports.reduce(
+      (distance, access) => Math.min(distance, Math.abs(access.start - loader.index)),
+      Number.POSITIVE_INFINITY,
+    );
+    if (defaultDistance > 600) {
+      continue;
+    }
+    const wrapperDistance = Math.abs(wrapperStart - loader.index);
+    if (!nearest || wrapperDistance < nearest.distance) {
+      nearest = { ...loader, distance: wrapperDistance };
+    }
+  }
+  return nearest;
+}
+
+function parseLoaderCall(node, ancestors) {
+  if (
+    node.type !== "CallExpression" ||
+    node.callee?.type !== "MemberExpression" ||
+    node.callee.object?.type !== "Identifier" ||
+    node.arguments?.length !== 1
+  ) {
+    return undefined;
+  }
+  const method = memberName(node.callee);
+  const moduleID = literalValue(node.arguments[0]);
+  if (!method || (typeof moduleID !== "string" && typeof moduleID !== "number")) {
+    return undefined;
+  }
+  const parent = ancestors.at(-1);
+  const grandparent = ancestors.at(-2);
+  const loadedWithThen =
+    parent?.type === "MemberExpression" &&
+    parent.object === node &&
+    memberName(parent) === "then" &&
+    grandparent?.type === "CallExpression" &&
+    grandparent.callee === parent;
+  const loadedWithAwait = ancestors.some((ancestor) => ancestor.type === "AwaitExpression");
+  if (method !== "A" && !loadedWithThen && !loadedWithAwait) {
+    return undefined;
+  }
+  return { index: node.start, moduleID: String(moduleID) };
+}
+
+function isDefaultExportAccess(node) {
+  return node.type === "MemberExpression" && memberName(node) === "default";
+}
+
+function memberName(node) {
+  if (!node.computed && node.property?.type === "Identifier") {
+    return node.property.name;
+  }
+  return node.computed ? literalValue(node.property) : undefined;
+}
+
+function literalValue(node) {
+  return node?.type === "Literal" ? node.value : undefined;
+}
+
+function walkFunctionBody(node, visitor) {
+  visitor(node);
+  for (const child of syntaxChildren(node)) {
+    if (
+      child !== node &&
+      (child.type === "FunctionDeclaration" ||
+        child.type === "FunctionExpression" ||
+        child.type === "ArrowFunctionExpression")
+    ) {
+      continue;
+    }
+    walkFunctionBody(child, visitor);
+  }
+}
+
+function walkSyntax(node, ancestors, visitor) {
+  visitor(node, ancestors);
+  const nextAncestors = [...ancestors, node];
+  for (const child of syntaxChildren(node)) {
+    walkSyntax(child, nextAncestors, visitor);
+  }
+}
+
+function syntaxChildren(node) {
+  const children = [];
+  for (const value of Object.values(node)) {
+    if (Array.isArray(value)) {
+      children.push(...value.filter((entry) => entry && typeof entry.type === "string"));
+    } else if (value && typeof value.type === "string") {
+      children.push(value);
+    }
+  }
+  return children;
 }
 
 export function isValidStatsigID(value) {
@@ -77,7 +361,7 @@ export function prepareStatsigDocument(source, metaContent = "") {
     return { found: false, source, metaContent: "" };
   }
 
-  const document = parse(source, { sourceCodeLocationInfo: true });
+  const document = parseHTML(source, { sourceCodeLocationInfo: true });
   const stack = [document];
   while (stack.length > 0) {
     const node = stack.pop();

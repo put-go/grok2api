@@ -232,7 +232,7 @@ async function createSession(metaContent) {
     activeMeta = documentMeta;
     recordVerification(verification, false);
     activePatch = {
-      version: "turbopack-wrapper-v1",
+      version: "turbopack-wrapper-v2",
       loaderModuleID: patchState.loaderModuleID,
       chunkPath: patchState.chunkPath,
     };

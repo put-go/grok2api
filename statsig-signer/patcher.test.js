@@ -27,6 +27,56 @@ test("patchStatsigChunk exposes the cached async factory wrapper", () => {
   );
 });
 
+test("patchStatsigChunk structurally exposes a changed async function wrapper", () => {
+  const source =
+    'const marker="x-statsig-id";async function sign(path, method) { cached ||= runtime.load("signer-v2").then(module => module.default()); const signer = await cached; return signer(path, method) };';
+  const result = patchStatsigChunk(source);
+
+  assert.equal(result.patched, true);
+  assert.equal(result.functionName, "sign");
+  assert.equal(result.loaderModuleID, "signer-v2");
+  assert.match(result.source, /};globalThis\.__grok2apiStatsigSign=sign;;/);
+  assert.doesNotThrow(() => new Function(result.source));
+});
+
+test("patchStatsigChunk structurally exposes a changed async arrow wrapper", () => {
+  const source =
+    'const marker="x-statsig-id";const sign=(load=async()=>{let module=await runtime.A("signer-v3");return module["default"]},async(path,method)=>{cache??=load();const signer=await cache;return await signer(path,method)}),next=1;';
+  const result = patchStatsigChunk(source);
+
+  assert.equal(result.patched, true);
+  assert.equal(result.functionName, "sign");
+  assert.equal(result.loaderModuleID, "signer-v3");
+  assert.match(result.source, /globalThis\.__grok2apiStatsigSign=async\(path,method\)=>/);
+  assert.doesNotThrow(() => new Function(result.source));
+});
+
+test("patchStatsigChunk structurally exposes a changed anonymous function expression", () => {
+  const source =
+    'const marker="x-statsig-id";const sign=(load=async()=>{const module=await runtime.A(9123);return module.default},async function(path,method){cache||=load();const signer=await cache;return signer(path,method)}),next=1;';
+  const result = patchStatsigChunk(source);
+
+  assert.equal(result.patched, true);
+  assert.equal(result.functionName, "sign");
+  assert.equal(result.loaderModuleID, "9123");
+  assert.match(result.source, /globalThis\.__grok2apiStatsigSign=async function\(path,method\)/);
+  assert.doesNotThrow(() => new Function(result.source));
+});
+
+test("patchStatsigChunk rejects ambiguous structural wrappers", () => {
+  const source =
+    'const marker="x-statsig-id";async function first(path,method){let module=await runtime.A(1),signer=module.default;return signer(path,method)}async function second(path,method){let module=await runtime.A(2),signer=module.default;return signer(path,method)}';
+
+  assert.deepEqual(patchStatsigChunk(source), { patched: false, source });
+});
+
+test("patchStatsigChunk rejects async two-argument decoys", () => {
+  const source =
+    'const marker="x-statsig-id";async function request(path,method){return fetch(path,method)}';
+
+  assert.deepEqual(patchStatsigChunk(source), { patched: false, source });
+});
+
 test("patchStatsigChunk leaves unrelated chunks unchanged", () => {
   const source = 'const header="x-statsig-id";';
   assert.deepEqual(patchStatsigChunk(source), { patched: false, source });
