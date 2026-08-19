@@ -63,6 +63,21 @@ test("patchStatsigChunk structurally exposes a changed anonymous function expres
   assert.doesNotThrow(() => new Function(result.source));
 });
 
+test("patchStatsigChunk exposes the current createBotoxSigner factory result", () => {
+  const source =
+    'e.s(["createBotoxSigner",0,function(e){let t;return async function(n,i){t??=e();let o=await t;return await o(n,i)}}],901317);e.s([],6224142);let ac=(0,d.createBotoxSigner)(async()=>(await e.A(4629918)).default()),ap=async e=>{e.headers["x-statsig-id"]=await ac(e.path,e.method)};';
+  const result = patchStatsigChunk(source);
+
+  assert.equal(result.patched, true);
+  assert.equal(result.functionName, "ac");
+  assert.equal(result.loaderModuleID, "4629918");
+  assert.match(
+    result.source,
+    /let ac=globalThis\.__grok2apiStatsigSign=\(0,d\.createBotoxSigner\)/,
+  );
+  assert.doesNotThrow(() => new Function(result.source));
+});
+
 test("patchStatsigChunk rejects ambiguous structural wrappers", () => {
   const source =
     'const marker="x-statsig-id";async function first(path,method){let module=await runtime.A(1),signer=module.default;return signer(path,method)}async function second(path,method){let module=await runtime.A(2),signer=module.default;return signer(path,method)}';

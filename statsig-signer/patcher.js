@@ -96,6 +96,11 @@ function findStructuralSignerWrapper(source) {
 
   const candidates = [];
   walkSyntax(syntaxTree, [], (node, ancestors) => {
+    const factoryCandidate = createBotoxSignerCandidate(node);
+    if (factoryCandidate) {
+      candidates.push(factoryCandidate);
+    }
+
     if (!isAsyncTwoArgumentFunction(node)) {
       return;
     }
@@ -135,6 +140,47 @@ function findStructuralSignerWrapper(source) {
     return undefined;
   }
   return candidates[0];
+}
+
+function createBotoxSignerCandidate(node) {
+  if (
+    node.type !== "VariableDeclarator" ||
+    node.id?.type !== "Identifier" ||
+    node.init?.type !== "CallExpression" ||
+    calledFunctionName(node.init.callee) !== "createBotoxSigner" ||
+    node.init.arguments?.length !== 1
+  ) {
+    return undefined;
+  }
+
+  const loaderFactory = node.init.arguments[0];
+  if (
+    (loaderFactory.type !== "FunctionExpression" && loaderFactory.type !== "ArrowFunctionExpression") ||
+    loaderFactory.async !== true ||
+    loaderFactory.params?.length !== 0
+  ) {
+    return undefined;
+  }
+  const loader = findSignerLoader(loaderFactory, node.init.start);
+  if (!loader) {
+    return undefined;
+  }
+  return {
+    start: node.init.start,
+    end: node.init.end,
+    declarationName: "",
+    functionName: node.id.name,
+    loaderModuleID: loader.moduleID,
+    score: 10,
+  };
+}
+
+function calledFunctionName(node) {
+  const value = node?.type === "ChainExpression" ? node.expression : node;
+  if (value?.type === "SequenceExpression") {
+    return calledFunctionName(value.expressions.at(-1));
+  }
+  return value?.type === "MemberExpression" ? memberName(value) : undefined;
 }
 
 function parseChunk(source) {
