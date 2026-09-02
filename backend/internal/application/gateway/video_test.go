@@ -934,4 +934,7 @@ func TestVideoWebForbiddenRetriesPinnedAccountOnceThenFailsOver(t *testing.T) {
 	if stored.Status != media.StatusFailed || stored.AccountID != first.ID {
 		t.Fatalf("unclassified failed job = %#v", stored)
 	}
+	if current, currentErr := service.selector.concurrency.Current(ctx, accountConcurrencyKey(first.ID)); currentErr != nil || current != 0 {
+		t.Fatalf("failed video job leaked account concurrency lease: current=%d err=%v", current, currentErr)
+	}
 }
