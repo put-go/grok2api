@@ -243,13 +243,13 @@ func parseChatFileDataURI(value, filename string, maxBytes int64) (provider.Imag
 
 func validatedImageMIME(data []byte, declared string) (string, error) {
 	detected := strings.ToLower(strings.TrimSpace(strings.Split(http.DetectContentType(data), ";")[0]))
-	declared = strings.ToLower(strings.TrimSpace(strings.Split(declared, ";")[0]))
 	if !supportedChatImageMIME(detected) {
 		return "", fmt.Errorf("%w: 不支持该图片格式", errInvalidChatImage)
 	}
-	if declared != "" && declared != "application/octet-stream" && declared != detected {
-		return "", fmt.Errorf("%w: Content-Type 与实际内容不一致", errInvalidChatImage)
-	}
+	// Some image hosts label files from their extension or metadata instead of
+	// the bytes they serve (for example, a PNG at a .jpg URL). The detected
+	// MIME is authoritative once the content is a supported image; this keeps
+	// valid images usable while still rejecting HTML, JSON, and other payloads.
 	return detected, nil
 }
 

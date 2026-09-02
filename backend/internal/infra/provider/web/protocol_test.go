@@ -355,6 +355,12 @@ func TestParseChatImageDataURIValidatesContent(t *testing.T) {
 	if image.MIMEType != "image/png" || image.Filename != "image.png" || len(image.Data) == 0 {
 		t.Fatalf("image = %#v", image)
 	}
+	// The bytes are PNG even though the data URI declares image/jpeg. Use the
+	// actual image format so mislabeled image hosts remain compatible.
+	mislabeled, err := parseChatImageDataURI(strings.Replace(value, "data:image/png", "data:image/jpeg", 1), 1<<20)
+	if err != nil || mislabeled.MIMEType != "image/png" || mislabeled.Filename != "image.png" {
+		t.Fatalf("mislabeled image = %#v err=%v", mislabeled, err)
+	}
 	if _, err := parseChatImageDataURI("data:image/png;base64,bm90IGFuIGltYWdl", 1<<20); err == nil {
 		t.Fatal("non-image data URI was accepted")
 	}
