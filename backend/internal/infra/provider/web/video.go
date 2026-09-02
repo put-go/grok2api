@@ -17,6 +17,7 @@ import (
 	"github.com/chenyme/grok2api/backend/internal/domain/account"
 	domainegress "github.com/chenyme/grok2api/backend/internal/domain/egress"
 	mediadomain "github.com/chenyme/grok2api/backend/internal/domain/media"
+	settingsdomain "github.com/chenyme/grok2api/backend/internal/domain/settings"
 	"github.com/chenyme/grok2api/backend/internal/infra/egress"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
 )
@@ -95,6 +96,22 @@ func isClearanceRefreshableMediaError(e *webMediaUpstreamError) bool {
 		return false
 	}
 	return e.cloudflareChallenge || e.bodyKind == "empty" || e.bodyKind == "html"
+}
+
+// isStatsigRefreshableMediaError identifies application-layer rejections that
+// tell the browser to reload its page state. Grok uses code 7 for this anti-bot
+// response, but the same code can also wrap a definitive account block; blocked
+// credentials must remain terminal and must not be replayed with a fresh signature.
+func isStatsigRefreshableMediaError(e *webMediaUpstreamError, body []byte) bool {
+	if e == nil || e.status != http.StatusForbidden || e.bodyKind != "json" || provider.IsDefinitiveAccountBlockBody(body) {
+		return false
+	}
+	_, message, structured := extractWebMediaUpstreamErrorFields(body)
+	if !structured {
+		return false
+	}
+	normalized := strings.ToLower(message)
+	return strings.Contains(normalized, "page is out of date") || strings.Contains(normalized, "reload to continue")
 }
 
 func (e *webMediaUpstreamError) providerResponse() *provider.Response {
@@ -312,7 +329,6 @@ func (a *Adapter) GenerateVideo(ctx context.Context, request provider.VideoReque
 		return provider.VideoResult{}, provider.WrapVideoStage(provider.VideoStagePrepare, 0, err)
 	}
 	defer lease.Release()
-	parentID := ""
 	referenceAssetIDs := make([]string, 0, len(rawReferences))
 	for _, rawReference := range rawReferences {
 		assetID, referenceErr := a.prepareVideoReference(ctx, cfg, lease, token, rawReference)
@@ -321,22 +337,22 @@ func (a *Adapter) GenerateVideo(ctx context.Context, request provider.VideoReque
 		}
 		referenceAssetIDs = append(referenceAssetIDs, assetID)
 	}
-	if len(referenceAssetIDs) == 0 {
-		parentID, err = a.createMediaPost(ctx, cfg, lease, token, "MEDIA_POST_TYPE_VIDEO", "", request.Prompt, "video_prompt_media_post")
-	}
-	if err != nil {
-		return provider.VideoResult{}, provider.WrapVideoStage(provider.VideoCreateFailureStage(err), 0, err)
-	}
-	segments := videoSegments(request.Duration)
-	if len(segments) == 0 {
+	if len(videoSegments(request.Duration)) == 0 {
 		return provider.VideoResult{}, provider.WrapVideoStage(provider.VideoStagePrepare, 0, fmt.Errorf("duration 必须在 1 到 15 秒之间"))
 	}
+	seconds := applyFreeWebVideoDurationCap(request.Duration, cfg.FreeVideoDurationCap, request.Credential)
+	segments := videoSegments(seconds)
 	ratio := resolveAspectRatio(request.AspectRatio)
 	resolution := request.Resolution
 	if resolution == "" {
 		resolution = "720p"
 	}
-	payload := videoCreatePayload(request.Prompt, parentID, ratio, resolution, segments[0], referenceAssetIDs)
+	var payload map[string]any
+	if len(referenceAssetIDs) > 0 {
+		payload = videoCreatePayload(request.Prompt, "", ratio, resolution, segments[0], referenceAssetIDs)
+	} else {
+		payload = videoCreatePayload(request.Prompt, ratio, resolution, segments[0])
+	}
 	response, err := a.postJSON(ctx, cfg, lease, token, cfg.BaseURL+"/rest/app-chat/conversations/new", payload, time.Duration(cfg.VideoTimeoutSeconds)*time.Second)
 	if err != nil {
 		return provider.VideoResult{}, provider.WrapVideoStage(provider.VideoCreateFailureStage(err), 0, err)
@@ -724,7 +740,28 @@ func videoSegments(seconds int) []int {
 	return []int{seconds}
 }
 
-func videoCreatePayload(prompt, parentID, ratio, resolution string, seconds int, referenceAssetIDs []string) map[string]any {
+// videoCreatePayload accepts both the current text-to-video shape
+// (ratio, resolution, seconds) and the legacy/reference shape used for
+// image-to-video requests (parentID, ratio, resolution, seconds, assets).
+func videoCreatePayload(prompt string, args ...any) map[string]any {
+	if len(args) == 3 {
+		ratio, _ := args[0].(string)
+		resolution, _ := args[1].(string)
+		seconds, _ := args[2].(int)
+		return videoCreateTextPayload(prompt, ratio, resolution, seconds)
+	}
+	if len(args) == 5 {
+		parentID, _ := args[0].(string)
+		ratio, _ := args[1].(string)
+		resolution, _ := args[2].(string)
+		seconds, _ := args[3].(int)
+		referenceAssetIDs, _ := args[4].([]string)
+		return videoCreatePayloadWithReferences(prompt, parentID, ratio, resolution, seconds, referenceAssetIDs)
+	}
+	return nil
+}
+
+func videoCreatePayloadWithReferences(prompt, parentID, ratio, resolution string, seconds int, referenceAssetIDs []string) map[string]any {
 	if len(referenceAssetIDs) > 0 {
 		mode := "custom"
 		inputKind := "referenceToVideo"
@@ -754,6 +791,50 @@ func videoCreatePayload(prompt, parentID, ratio, resolution string, seconds int,
 		"temporary": true, "modelName": "imagine-video-gen", "message": prompt + " --mode=custom", "enableSideBySide": true,
 		"responseMetadata": map[string]any{"experiments": []any{}, "modelConfigOverride": map[string]any{"modelMap": map[string]any{"videoGenModelConfig": config}}},
 	}
+}
+
+func videoCreateTextPayload(prompt, ratio, resolution string, seconds int) map[string]any {
+	return map[string]any{
+		"modelName":            "imagine-video-gen",
+		"message":              prompt + " --mode=custom",
+		"enableImageStreaming": true,
+		"enableSideBySide":     true,
+		"sendFinalMetadata":    true,
+		"responseMetadata": map[string]any{
+			"experiments":         []any{},
+			"modelConfigOverride": map[string]any{"modelMap": map[string]any{}},
+		},
+		"mediaGenInput": map[string]any{
+			"textToVideo": map[string]any{
+				"prompt":         prompt,
+				"aspectRatio":    ratio,
+				"duration":       seconds,
+				"resolutionName": resolution,
+			},
+		},
+		"kind": "CONVERSATION_KIND_IMAGINE",
+	}
+}
+
+func normalizeFreeVideoDurationCap(value int) int {
+	return settingsdomain.NormalizeWebFreeVideoDurationCap(value)
+}
+
+func shouldCapWebVideoDuration(credential account.Credential) bool {
+	return credential.WebTier == account.WebTierBasic
+}
+
+// applyFreeWebVideoDurationCap clamps duration for free-tier Web accounts so
+// upstream 429s from >6s (or the configured cap) do not trigger useless account rotation.
+func applyFreeWebVideoDurationCap(seconds, cap int, credential account.Credential) int {
+	if !shouldCapWebVideoDuration(credential) {
+		return seconds
+	}
+	cap = normalizeFreeVideoDurationCap(cap)
+	if seconds > cap {
+		return cap
+	}
+	return seconds
 }
 
 func videoModeMessage(prompt, mode string) string {

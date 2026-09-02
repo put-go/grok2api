@@ -388,9 +388,15 @@ type Response struct {
 	QuotaUnits  int
 	UpstreamURL string
 	Diagnostic  *DiagnosticResponse
+	// ReasoningRecoveryFailed is an internal retry hint emitted only after the Build
+	// adapter exhausts same-account recovery for an opaque reasoning 400. Gateway
+	// policy must not infer this state from an upstream-controlled response header.
+	ReasoningRecoveryFailed bool
 	// RecoveredPrimaryFailure records a primary-plane failure hidden by a successful Provider fallback.
 	RecoveredPrimaryFailure *DiagnosticResponse
-	RateLimit               *RateLimitMetadata
+	// RecoveredAttempts 保存被 adapter 内部恢复流程隐藏、但仍需进入请求审计的上游调用。
+	RecoveredAttempts []RecoveredAttempt
+	RateLimit         *RateLimitMetadata
 	// ModelCatalogChanged indicates that the model catalog ETag in an inference response differs from
 	// the ETag from the account's most recent successful /models sync.
 	ModelCatalogChanged bool
@@ -420,6 +426,17 @@ type DiagnosticResponse struct {
 	Header        http.Header
 	Body          []byte
 	BodyTruncated bool
+}
+
+// RecoveredAttempt 表示一次被后续恢复结果替代的真实上游调用。
+type RecoveredAttempt struct {
+	Stage       string
+	Result      string
+	UpstreamURL string
+	StartedAt   time.Time
+	DurationMS  int64
+	Diagnostic  DiagnosticResponse
+	Failure     error
 }
 
 // ReadDiagnosticBody reads up to the diagnostic body limit and reports whether upstream content was truncated.
@@ -1247,6 +1264,30 @@ func (r *Registry) TierGroups(value account.Provider, upstreamModel string) acco
 		return nil
 	}
 	return metadata.TierGroups(upstreamModel)
+}
+
+// TierOrder exposes the flattened routing preference used by newer selectors.
+// Providers that still expose grouped tiers are converted without changing
+// their ordering semantics.
+func (r *Registry) TierOrder(value account.Provider, upstreamModel string) []account.WebTier {
+	adapter, ok := r.Get(value)
+	if !ok {
+		return nil
+	}
+	if metadata, ok := adapter.(interface {
+		TierOrder(string) []account.WebTier
+	}); ok {
+		return metadata.TierOrder(upstreamModel)
+	}
+	if metadata, ok := adapter.(RoutingMetadataAdapter); ok {
+		groups := metadata.TierGroups(upstreamModel)
+		order := make([]account.WebTier, 0, len(groups)*2)
+		for _, group := range groups {
+			order = append(order, group...)
+		}
+		return order
+	}
+	return nil
 }
 
 func (r *Registry) TierOrderForQuotaMode(value account.Provider, upstreamModel, quotaMode string) []account.WebTier {

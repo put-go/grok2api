@@ -69,13 +69,14 @@ const (
 	EgressModeProxy  EgressMode = "proxy"
 )
 
-// Record 表示推理请求审计；成功请求不保存正文，失败请求仅保留受限诊断快照。
+// Record 表示推理请求审计；成功请求通常不保存正文，仅允许保留 adapter 内部恢复失败的受限脱敏诊断。
 type Record struct {
 	ID                      uint64
 	EventID                 string
 	RequestID               string
 	ClientKeyID             uint64
 	ClientKeyName           string
+	ClientIP                string
 	ModelRouteID            uint64
 	ModelPublicID           string
 	ModelUpstreamModel      string
@@ -110,6 +111,9 @@ type Record struct {
 	FirstTokenMS            *int64
 	DurationMS              int64
 	ErrorCode               string
+	RequestMethod           string
+	RequestPath             string
+	RequestHeaders          map[string][]string
 	AttemptCount            int
 	Attempts                []Attempt
 	CreatedAt               time.Time

@@ -2,6 +2,7 @@ package inference
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -27,6 +28,12 @@ type idleErrorReader struct{}
 
 func (idleErrorReader) Read([]byte) (int, error) {
 	return 0, neterror.ErrUpstreamStreamIdleTimeout
+}
+
+type outputLoopErrorReader struct{}
+
+func (outputLoopErrorReader) Read([]byte) (int, error) {
+	return 0, fmt.Errorf("%w (repeated content delta 129 times)", neterror.ErrUpstreamOutputLoop)
 }
 
 type chunkErrorReader struct {
@@ -458,6 +465,35 @@ func TestDirectUpstreamCredentialResponsesAreRewritten(t *testing.T) {
 			}
 			if tc.wantCode == "permission-denied" && !strings.Contains(recorder.Body.String(), "上游服务暂不可用，聊天端点访问被拒绝") {
 				t.Fatalf("permission message missing: %s", recorder.Body.String())
+			}
+		})
+	}
+}
+
+func TestNonStreamingEmptyAndIdleResponsesFailBeforeCommittingSuccess(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	handler := NewHandler(nil, nil, 1<<20)
+	for _, test := range []struct {
+		name       string
+		body       io.ReadCloser
+		wantStatus int
+		wantCode   string
+	}{
+		{name: "empty", body: io.NopCloser(strings.NewReader("")), wantStatus: http.StatusBadGateway, wantCode: "upstream_response_empty"},
+		{name: "idle", body: io.NopCloser(idleErrorReader{}), wantStatus: http.StatusGatewayTimeout, wantCode: "upstream_stream_idle_timeout"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			finalCode := ""
+			result := &gateway.Result{
+				StatusCode: http.StatusOK, Status: "200 OK", Header: http.Header{"Content-Type": {"application/json"}}, Body: test.body,
+				Finalize: func(_ gateway.Usage, _, code string) { finalCode = code },
+			}
+			router := gin.New()
+			router.GET("/", func(c *gin.Context) { handler.writeResult(c, result, false, streamProtocolResponses) })
+			recorder := httptest.NewRecorder()
+			router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/", nil))
+			if recorder.Code != test.wantStatus || finalCode != test.wantCode || !strings.Contains(recorder.Body.String(), `"`+test.wantCode+`"`) {
+				t.Fatalf("status=%d body=%s finalize=%q", recorder.Code, recorder.Body.String(), finalCode)
 			}
 		})
 	}
@@ -981,8 +1017,8 @@ func TestStreamInspectorMarksChatReasoningComment(t *testing.T) {
 }
 
 func TestInternalSSEMarkerFilterAcrossChunkBoundaries(t *testing.T) {
-	marker := reasoningStartSSEComment + "\n\n"
-	input := []byte("data: before\n\n" + marker + "data: after\n\n")
+	markers := reasoningStartSSEComment + "\n\n" + reasoningEvidenceSSEComment + "\n\n"
+	input := []byte("data: before\n\n" + markers + "data: after\n\n")
 	want := "data: before\n\ndata: after\n\n"
 	for split := 0; split <= len(input); split++ {
 		filter := internalSSEMarkerFilter{enabled: true}
@@ -1002,6 +1038,7 @@ func TestCopyStreamConsumesInternalReasoningMarker(t *testing.T) {
 	context, _ := gin.CreateTestContext(recorder)
 	body := `data: {"choices":[{"delta":{"role":"assistant"}}]}` + "\n\n" +
 		": grok2api-reasoning-start\n\n" +
+		": grok2api-reasoning-evidence\n\n" +
 		`data: {"choices":[{"delta":{"content":"hello"}}]}` + "\n\n" +
 		"data: [DONE]\n\n"
 	marked := 0
@@ -1011,11 +1048,31 @@ func TestCopyStreamConsumesInternalReasoningMarker(t *testing.T) {
 	if marked != 1 {
 		t.Fatalf("first token marked %d times", marked)
 	}
-	if strings.Contains(recorder.Body.String(), "grok2api-reasoning-start") {
+	if strings.Contains(recorder.Body.String(), "grok2api-reasoning-") {
 		t.Fatalf("internal marker leaked to client: %q", recorder.Body.String())
 	}
 	if !strings.Contains(recorder.Body.String(), `"content":"hello"`) {
 		t.Fatalf("visible Chat delta missing: %q", recorder.Body.String())
+	}
+}
+
+func TestCopyStreamConsumesAnthropicReasoningEvidenceMarker(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	body := ": grok2api-reasoning-evidence\n\n" +
+		"event: content_block_delta\n" +
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig"}}` + "\n\n" +
+		"event: message_stop\n" +
+		`data: {"type":"message_stop"}` + "\n\n"
+	if _, err := copyStream(context.Writer, strings.NewReader(body), streamProtocolAnthropic, nil); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(recorder.Body.String(), "grok2api-reasoning-evidence") {
+		t.Fatalf("internal Anthropic marker leaked to client: %q", recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), `"signature":"sig"`) {
+		t.Fatalf("Anthropic signature delta missing: %q", recorder.Body.String())
 	}
 }
 
@@ -1037,6 +1094,28 @@ func TestCopyStreamPreservesBufferedTailOnReadError(t *testing.T) {
 	}
 }
 
+func TestClassifyCopyErrorDistinguishesClientFromUpstream(t *testing.T) {
+	readErr := fmt.Errorf("%w: cut", errUpstreamStreamRead)
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if got := classifyCopyError(canceled, readErr); got != "client_stream_interrupted" {
+		t.Fatalf("client abort = %q", got)
+	}
+	if got := classifyCopyError(context.Background(), readErr); got != "upstream_stream_interrupted" {
+		t.Fatalf("upstream abort = %q", got)
+	}
+	idle, stop := context.WithCancelCause(context.Background())
+	stop(neterror.ErrUpstreamStreamIdleTimeout)
+	idleErr := fmt.Errorf("%w: %w", errUpstreamStreamRead, neterror.ErrUpstreamStreamIdleTimeout)
+	if got := classifyCopyError(idle, idleErr); got != "upstream_stream_idle_timeout" {
+		t.Fatalf("idle timeout = %q", got)
+	}
+	loopErr := fmt.Errorf("%w: %w", errUpstreamStreamRead, neterror.ErrUpstreamOutputLoop)
+	if got := classifyCopyError(context.Background(), loopErr); got != "upstream_output_loop" {
+		t.Fatalf("output loop = %q", got)
+	}
+}
+
 func TestCopyStreamWritesTerminalOnIdleTimeout(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	tests := []struct {
@@ -1045,15 +1124,44 @@ func TestCopyStreamWritesTerminalOnIdleTimeout(t *testing.T) {
 		want     []string
 	}{
 		{name: "chat", protocol: streamProtocolChat, want: []string{`"code":"upstream_stream_idle_timeout"`, "data: [DONE]"}},
-		{name: "responses", protocol: streamProtocolResponses, want: []string{`"type":"response.incomplete"`, `"id":"resp_abort"`, `"created_at":`, `"sequence_number":`, `"incomplete_details"`}},
+		{name: "responses", protocol: streamProtocolResponses, want: []string{`"type":"response.failed"`, `"id":"resp_abort"`, `"created_at":`, `"sequence_number":`, `"code":"server_error"`, `"message":"upstream_stream_idle_timeout:`, `"status":"failed"`, `"model":"grok-test"`}},
 		{name: "anthropic", protocol: streamProtocolAnthropic, want: []string{`"type":"error"`, "上游流式响应长时间无数据"}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			recorder := httptest.NewRecorder()
 			context, _ := gin.CreateTestContext(recorder)
-			_, err := copyStream(context.Writer, &idleErrorReader{}, test.protocol, nil)
+			_, err := copyStreamWithFallbackModel(context.Writer, &idleErrorReader{}, test.protocol, nil, "grok-test")
 			if !errors.Is(err, errUpstreamStreamRead) || !errors.Is(err, neterror.ErrUpstreamStreamIdleTimeout) {
+				t.Fatalf("copy error = %v", err)
+			}
+			got := recorder.Body.String()
+			for _, fragment := range test.want {
+				if !strings.Contains(got, fragment) {
+					t.Fatalf("body %q missing %q", got, fragment)
+				}
+			}
+		})
+	}
+}
+
+func TestCopyStreamWritesTerminalOnOutputLoop(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	tests := []struct {
+		name     string
+		protocol streamProtocol
+		want     []string
+	}{
+		{name: "chat", protocol: streamProtocolChat, want: []string{`"code":"upstream_output_loop"`, "data: [DONE]"}},
+		{name: "responses", protocol: streamProtocolResponses, want: []string{`"type":"response.failed"`, `"code":"server_error"`, `"message":"upstream_output_loop:`, `"status":"failed"`}},
+		{name: "anthropic", protocol: streamProtocolAnthropic, want: []string{`"type":"error"`, `"message":"upstream_output_loop: 上游输出陷入循环"`}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			context, _ := gin.CreateTestContext(recorder)
+			_, err := copyStreamWithFallbackModel(context.Writer, &outputLoopErrorReader{}, test.protocol, nil, "grok-test")
+			if !errors.Is(err, errUpstreamStreamRead) || !errors.Is(err, neterror.ErrUpstreamOutputLoop) {
 				t.Fatalf("copy error = %v", err)
 			}
 			got := recorder.Body.String()
@@ -1100,7 +1208,7 @@ func TestCopyStreamFlushesUnterminatedResponsesTailBeforeAbort(t *testing.T) {
 		t.Fatalf("copy error = %v", err)
 	}
 	got := recorder.Body.String()
-	if !strings.Contains(got, `"delta":"partial"`) || !strings.Contains(got, "\n\nevent: response.incomplete") {
+	if !strings.Contains(got, `"delta":"partial"`) || !strings.Contains(got, "\n\nevent: response.failed") {
 		t.Fatalf("unterminated tail and abort event were not separated: %q", got)
 	}
 	if marked != 1 {
@@ -1124,7 +1232,7 @@ func TestCopyStreamDropsMalformedResponsesTailBeforeAbort(t *testing.T) {
 	if strings.Contains(got, string(malformed)) {
 		t.Fatalf("malformed tail leaked before terminal event: %q", got)
 	}
-	if !strings.Contains(got, `"type":"response.incomplete"`) {
+	if !strings.Contains(got, `"type":"response.failed"`) {
 		t.Fatalf("abort event missing after malformed tail: %q", got)
 	}
 }
@@ -1148,25 +1256,87 @@ func TestCopyStreamWritesTerminalOnIncompleteEOF(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	recorder := httptest.NewRecorder()
 	context, _ := gin.CreateTestContext(recorder)
-	_, err := copyStream(context.Writer, strings.NewReader(""), streamProtocolResponses, nil)
+	_, err := copyStreamWithFallbackModel(context.Writer, strings.NewReader(""), streamProtocolResponses, nil, "grok-test")
 	if !errors.Is(err, errUpstreamStreamIncomplete) {
 		t.Fatalf("copy error = %v", err)
 	}
 	got := recorder.Body.String()
-	if !strings.Contains(got, `"type":"response.incomplete"`) || !strings.Contains(got, `"reason":"upstream_stream_incomplete"`) {
+	if !strings.Contains(got, `"type":"response.failed"`) || !strings.Contains(got, `"code":"server_error"`) || !strings.Contains(got, `"message":"upstream_stream_incomplete:`) || !strings.Contains(got, `"model":"grok-test"`) {
 		t.Fatalf("incomplete EOF missing terminal SSE event: %q", got)
 	}
 }
 
 func TestSanitizeResponsesFillsMissingIDs(t *testing.T) {
-	state := &responsesCompatState{}
+	state := &responsesCompatState{model: "grok-test"}
 	got := rewriteResponsesDataLine([]byte(`data: {"type":"response.output_item.added","item":{"type":"reasoning"}}`+"\n"), state)
 	if !bytes.Contains(got, []byte(`"id":"item_1"`)) {
 		t.Fatalf("item id not filled: %s", got)
 	}
 	got = rewriteResponsesDataLine([]byte(`data: {"type":"response.created","response":{"status":"in_progress"}}`+"\n"), state)
-	if !bytes.Contains(got, []byte(`"id":"resp_abort"`)) || !bytes.Contains(got, []byte(`"created_at":`)) {
-		t.Fatalf("response id/created_at not filled: %s", got)
+	if !bytes.Contains(got, []byte(`"id":"resp_abort"`)) || !bytes.Contains(got, []byte(`"created_at":`)) || !bytes.Contains(got, []byte(`"model":"grok-test"`)) {
+		t.Fatalf("response id/created_at/model not filled: %s", got)
+	}
+}
+
+func TestCopyStreamAbortTrailerAlwaysIncludesModel(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	_, err := copyStreamWithFallbackModel(context.Writer, &idleErrorReader{}, streamProtocolResponses, nil, "grok-test")
+	if !errors.Is(err, errUpstreamStreamRead) {
+		t.Fatalf("copy error = %v", err)
+	}
+	got := recorder.Body.String()
+	if !strings.Contains(got, `"type":"response.failed"`) || !strings.Contains(got, `"model":"grok-test"`) {
+		t.Fatalf("abort trailer missing model: %q", got)
+	}
+}
+
+func TestCopyStreamAbortTrailerPrefersUpstreamModel(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	body := []byte(`data: {"type":"response.created","response":{"id":"resp_real","model":"upstream-model","status":"in_progress"}}` + "\n\n")
+	_, err := copyStreamWithFallbackModel(context.Writer, &chunkErrorReader{data: body}, streamProtocolResponses, nil, "request-model")
+	if !errors.Is(err, errUpstreamStreamRead) {
+		t.Fatalf("copy error = %v", err)
+	}
+	got := recorder.Body.String()
+	failedAt := strings.LastIndex(got, "event: response.failed")
+	if failedAt < 0 {
+		t.Fatalf("abort trailer missing: %q", got)
+	}
+	failed := got[failedAt:]
+	if !strings.Contains(failed, `"model":"upstream-model"`) || strings.Contains(failed, `"model":"request-model"`) {
+		t.Fatalf("abort trailer did not prefer upstream model: %q", failed)
+	}
+}
+
+func TestResponsesAbortTrailerUsesStandardErrorShape(t *testing.T) {
+	trailer := streamAbortTrailer(
+		streamProtocolResponses,
+		neterror.ErrUpstreamStreamIdleTimeout,
+		responseMetadata{},
+		&responsesCompatState{model: "grok-test"},
+	)
+	dataAt := bytes.Index(trailer, []byte("data: "))
+	if dataAt < 0 {
+		t.Fatalf("abort trailer missing data line: %q", trailer)
+	}
+	payload := bytes.TrimSpace(trailer[dataAt+len("data: "):])
+	var event struct {
+		Response struct {
+			Error map[string]any `json:"error"`
+		} `json:"response"`
+	}
+	if err := json.Unmarshal(payload, &event); err != nil {
+		t.Fatalf("decode abort trailer: %v; payload=%q", err, payload)
+	}
+	if event.Response.Error["code"] != "server_error" || !strings.Contains(stringAny(event.Response.Error["message"]), "upstream_stream_idle_timeout") {
+		t.Fatalf("unexpected Responses error: %#v", event.Response.Error)
+	}
+	if _, exists := event.Response.Error["type"]; exists {
+		t.Fatalf("Responses error contains non-protocol type: %#v", event.Response.Error)
 	}
 }
 
@@ -1217,6 +1387,26 @@ func TestSanitizeResponsesDoesNotAddResponseIDToErrorEvent(t *testing.T) {
 	got := rewriteResponsesDataLine([]byte(`data: {"type":"error","code":"server_error","message":"failed"}`+"\n"), state)
 	if bytes.Contains(got, []byte(`"id":`)) {
 		t.Fatalf("Responses error event gained a non-protocol response id: %s", got)
+	}
+}
+
+func TestSanitizeResponsesFillsMissingOutputTextAnnotations(t *testing.T) {
+	state := &responsesCompatState{}
+	added := rewriteResponsesDataLine([]byte(`data: {"type":"response.output_item.added","item":{"type":"message","content":[{"type":"output_text","text":"hi"}]}}`+"\n"), state)
+	if !bytes.Contains(added, []byte(`"annotations":[]`)) {
+		t.Fatalf("item output_text missing annotations: %s", added)
+	}
+	completed := rewriteResponsesDataLine([]byte(`data: {"type":"response.completed","response":{"id":"resp_1","output":[{"type":"message","content":[{"type":"output_text","text":"hi"}]}]}}`+"\n"), state)
+	if !bytes.Contains(completed, []byte(`"annotations":[]`)) {
+		t.Fatalf("completed output_text missing annotations: %s", completed)
+	}
+	part := rewriteResponsesDataLine([]byte(`data: {"type":"response.content_part.added","part":{"type":"output_text","text":"hi"}}`+"\n"), state)
+	if !bytes.Contains(part, []byte(`"annotations":[]`)) {
+		t.Fatalf("content_part output_text missing annotations: %s", part)
+	}
+	kept := rewriteResponsesDataLine([]byte(`data: {"type":"response.output_item.done","item":{"type":"message","content":[{"type":"output_text","text":"hi","annotations":[{"type":"url_citation","url":"https://x.test"}]}]}}`+"\n"), state)
+	if !bytes.Contains(kept, []byte(`"url":"https://x.test"`)) || bytes.Contains(kept, []byte(`"annotations":[]`)) {
+		t.Fatalf("existing annotations were replaced: %s", kept)
 	}
 }
 
@@ -1462,6 +1652,166 @@ func TestWriteResultRecordsStreamFailureDiagnostic(t *testing.T) {
 	}
 }
 
+func TestWriteResultClientAbortKeepsUpstreamStatus(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	handler := NewHandler(nil, nil, 1<<20)
+	var finalCode string
+	result := &gateway.Result{
+		StatusCode: http.StatusOK,
+		Status:     "200 OK",
+		Header:     http.Header{"Content-Type": {"text/event-stream"}},
+		Body:       io.NopCloser(&chunkErrorReader{data: []byte("data: {\"type\":\"response.created\"}\n\n")}),
+		Finalize:   func(_ gateway.Usage, _, code string) { finalCode = code },
+	}
+	router := gin.New()
+	router.POST("/", func(c *gin.Context) {
+		handler.writeResult(c, result, true, streamProtocolResponses)
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/", nil).WithContext(ctx))
+	if recorder.Code != http.StatusOK || finalCode != "client_stream_interrupted" {
+		t.Fatalf("status=%d finalize=%q body=%q", recorder.Code, finalCode, recorder.Body.String())
+	}
+}
+
+func TestWriteResultUpstreamCutStaysUpstreamInterrupted(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	handler := NewHandler(nil, nil, 1<<20)
+	var finalCode string
+	result := &gateway.Result{
+		StatusCode: http.StatusOK,
+		Status:     "200 OK",
+		Header:     http.Header{"Content-Type": {"text/event-stream"}},
+		Body:       io.NopCloser(&chunkErrorReader{data: []byte("data: {\"type\":\"response.created\"}\n\n")}),
+		Finalize:   func(_ gateway.Usage, _, code string) { finalCode = code },
+	}
+	router := gin.New()
+	router.POST("/", func(c *gin.Context) {
+		handler.writeResult(c, result, true, streamProtocolResponses)
+	})
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/", nil))
+	if recorder.Code != http.StatusOK || finalCode != "upstream_stream_interrupted" {
+		t.Fatalf("status=%d finalize=%q body=%q", recorder.Code, finalCode, recorder.Body.String())
+	}
+}
+
+func TestWriteProtocolResultMapsJSONInvalidArgumentWithoutCopyStream(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	handler := NewHandler(nil, nil, 1<<20)
+	body := `{"code":"invalid-argument","error":"mcp__codex_app__automation_update: tool parameter root must be an object type (root schema is an anyOf/oneOf union with a non-object branch)"}`
+	var finalCode string
+	recorded := false
+	result := &gateway.Result{
+		StatusCode: http.StatusBadRequest,
+		Status:     "400 Bad Request",
+		Header:     http.Header{"Content-Type": {"application/json"}, "Content-Length": {fmt.Sprintf("%d", len(body))}},
+		Body:       io.NopCloser(strings.NewReader(body)),
+		RecordStreamFailure: func(gateway.StreamFailureDiagnostic) {
+			recorded = true
+		},
+		Finalize: func(_ gateway.Usage, _, code string) {
+			finalCode = code
+		},
+	}
+	router := gin.New()
+	router.GET("/", func(c *gin.Context) {
+		handler.writeResponsesResult(c, result, true, "")
+	})
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/", nil))
+	if recorder.Code != http.StatusBadRequest || recorded || finalCode != "invalid_argument" {
+		t.Fatalf("status=%d recorded=%v final=%q body=%s", recorder.Code, recorded, finalCode, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), "mcp__codex_app__automation_update") || strings.Contains(recorder.Body.String(), "upstream_stream_incomplete") {
+		t.Fatalf("body=%s", recorder.Body.String())
+	}
+}
+
+func TestWriteProtocolResultAnthropicJSONReadFailureKeepsAnthropicShape(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	handler := NewHandler(nil, nil, 1<<20)
+	var finalCode string
+	result := &gateway.Result{
+		StatusCode: http.StatusBadRequest,
+		Status:     "400 Bad Request",
+		Header:     http.Header{"Content-Type": {"application/json"}},
+		Body:       io.NopCloser(&chunkErrorReader{data: []byte(`{"error":"partial"}`)}),
+		Finalize: func(_ gateway.Usage, _, code string) {
+			finalCode = code
+		},
+	}
+	router := gin.New()
+	router.GET("/", func(c *gin.Context) {
+		handler.writeAnthropicResult(c, result, true)
+	})
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/", nil))
+
+	var payload struct {
+		Type  string `json:"type"`
+		Error struct {
+			Type string `json:"type"`
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if recorder.Code != http.StatusBadGateway || payload.Type != "error" || payload.Error.Type != "api_error" || payload.Error.Code != "upstream_error" || finalCode != "upstream_error" {
+		t.Fatalf("status=%d payload=%#v final=%q body=%s", recorder.Code, payload, finalCode, recorder.Body.String())
+	}
+}
+
+func TestWriteProtocolResultDoesNotRemapOtherJSON4xxAsServerError(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	handler := NewHandler(nil, nil, 1<<20)
+	body := `{"error":{"code":"not_found","message":"requested response is missing"}}`
+	var finalCode string
+	result := &gateway.Result{
+		StatusCode: http.StatusNotFound,
+		Status:     "404 Not Found",
+		Header:     http.Header{"Content-Type": {"application/json"}},
+		Body:       io.NopCloser(strings.NewReader(body)),
+		Finalize: func(_ gateway.Usage, _, code string) {
+			finalCode = code
+		},
+	}
+	router := gin.New()
+	router.GET("/", func(c *gin.Context) {
+		handler.writeResponsesResult(c, result, true, "")
+	})
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/", nil))
+	if recorder.Code != http.StatusNotFound || finalCode != "upstream_error" || !strings.Contains(recorder.Body.String(), "requested response is missing") {
+		t.Fatalf("status=%d final=%q body=%s", recorder.Code, finalCode, recorder.Body.String())
+	}
+}
+
+func TestWriteResultOutputLoopFinalizesDistinctCode(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	handler := NewHandler(nil, nil, 1<<20)
+	var finalCode string
+	result := &gateway.Result{
+		StatusCode: http.StatusOK,
+		Status:     "200 OK",
+		Header:     http.Header{"Content-Type": {"text/event-stream"}},
+		Body:       io.NopCloser(&outputLoopErrorReader{}),
+		Finalize:   func(_ gateway.Usage, _, code string) { finalCode = code },
+	}
+	router := gin.New()
+	router.POST("/", func(c *gin.Context) {
+		handler.writeResult(c, result, true, streamProtocolResponses)
+	})
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/", nil))
+	if recorder.Code != http.StatusOK || finalCode != "upstream_output_loop" || !strings.Contains(recorder.Body.String(), `"message":"upstream_output_loop:`) {
+		t.Fatalf("status=%d finalize=%q body=%q", recorder.Code, finalCode, recorder.Body.String())
+	}
+}
+
 func TestProjectStreamFailureDiagnosticBoundsErrorMessage(t *testing.T) {
 	diagnostic := projectStreamFailureDiagnostic([]byte(`{"type":"error","error":{"code":"server_error","message":"` + strings.Repeat("错误", maxStreamFailureDiagnosticBytes) + `"},"output":"must-not-be-audited"}`))
 	if !diagnostic.BodyTruncated || len(diagnostic.Body) > maxStreamFailureDiagnosticBytes || len(diagnostic.Body) == 0 || !utf8.Valid(diagnostic.Body) || strings.Contains(string(diagnostic.Body), "must-not-be-audited") {
@@ -1557,6 +1907,7 @@ func TestSelectionErrorResponseDistinguishesCoolingAndSaturation(t *testing.T) {
 		{name: "cooling", failure: &gateway.SelectionUnavailableError{Reason: gateway.SelectionCooling, RetryAfter: 1500 * time.Millisecond}, status: http.StatusTooManyRequests, code: "upstream_cooling", retryAfter: "2"},
 		{name: "model cooling", failure: &gateway.SelectionUnavailableError{Reason: gateway.SelectionModelCooling, RetryAfter: time.Second}, status: http.StatusTooManyRequests, code: "upstream_model_cooling", retryAfter: "1"},
 		{name: "saturated", failure: &gateway.SelectionUnavailableError{Reason: gateway.SelectionSaturated, RetryAfter: time.Second}, status: http.StatusServiceUnavailable, code: "upstream_saturated", retryAfter: "1"},
+		{name: "pinned unavailable", failure: &gateway.SelectionUnavailableError{Reason: gateway.SelectionPinnedUnavailable, AccountID: 9}, status: http.StatusServiceUnavailable, code: "upstream_pinned_account_unavailable"},
 		{name: "scoped account range", failure: &gateway.SelectionUnavailableError{Reason: gateway.SelectionNoAccounts, Scope: clientkeydomain.AccountScope{Providers: clientkeydomain.ProviderScopeBuild, Tiers: clientkeydomain.TierScopeFree}}, status: http.StatusServiceUnavailable, code: "client_key_account_scope_unavailable"},
 	} {
 		t.Run(test.name, func(t *testing.T) {

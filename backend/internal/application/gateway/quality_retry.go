@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"math"
 	"net/http"
 	"strings"
 	"time"
@@ -17,18 +18,23 @@ import (
 )
 
 const (
-	ErrorQualityDegraded             = "quality_degraded"
-	qualityRetryFailOpen             = "fail_open"
-	qualityRetryFailClosed           = "fail_closed"
-	defaultQualityMaxAttempts        = 6
-	defaultQualityHoldTimeout        = 3 * time.Second
-	defaultQualityMinOutput          = int64(32)
-	defaultMissingThinkingCooldown   = 24 * time.Hour
-	lastErrorMissingThinking         = accountdomain.LastErrorMissingThinking
-	lastErrorMissingThinkingDisabled = accountdomain.LastErrorMissingThinkingDisabled
+	ErrorQualityDegraded                   = "quality_degraded"
+	qualityRetryFailOpen                   = "fail_open"
+	qualityRetryFailClosed                 = "fail_closed"
+	defaultQualityMaxAttempts              = 6
+	defaultQualityHoldTimeout              = 30 * time.Second
+	defaultQualityMinOutput                = int64(8)
+	defaultMinEncryptedBytes               = 256
+	defaultEncryptedBytesPerReasoningToken = 4
+	defaultBurstFlushMS                    = int64(1000)
+	defaultBurstMaxVisible                 = int64(32)
+	defaultBurstMinReasoning               = int64(80)
+	defaultMissingThinkingCooldown         = 12 * time.Hour
+	lastErrorMissingThinking               = accountdomain.LastErrorMissingThinking
+	lastErrorMissingThinkingDisabled       = accountdomain.LastErrorMissingThinkingDisabled
 	// An empty stream that idles while held is treated as an account-quality
 	// failure: the request can still rotate before any bytes reach the client.
-	qualityIdleAccountCooldown = 24 * time.Hour
+	qualityIdleAccountCooldown = 15 * time.Minute
 )
 
 var (
@@ -45,17 +51,32 @@ type QualityRetryRuntime struct {
 	MinOutputTokens int64
 	OnExhausted     string
 	AccountCooldown time.Duration
+	// IdleAccountCooldown is applied to truly empty upstream streams
+	// (idle timeout / empty peek). Missing-thinking still uses AccountCooldown.
+	IdleAccountCooldown             time.Duration
+	MinEncryptedBytes               int
+	EncryptedBytesPerReasoningToken int
 }
 
 // QualityStreamSignals is the hold classifier input. Tests drive this
 // directly and via ObserveQualityChunk on SSE fixtures.
 type QualityStreamSignals struct {
-	HasThinking     bool
-	VisibleTokens   int64
-	ReasoningTokens int64
-	OutputTokens    int64
-	Terminal        bool
-	HoldExpired     bool
+	HasThinking       bool
+	HasReasoningDelta bool
+	// ReasoningStarted is an empty reasoning item or the Chat SSE stub
+	// `: grok2api-reasoning-start`. That is not proof of thinking: 降智
+	// still emits the stub, then dumps visible tokens with usage 0.
+	ReasoningStarted bool
+	VisibleTokens    int64
+	ReasoningTokens  int64
+	OutputTokens     int64
+	EncryptedBytes   int
+	EncryptedFloor   int64
+	UsageReported    bool
+	FirstVisible     bool
+	VisibleFlushMS   int64
+	Terminal         bool
+	HoldExpired      bool
 }
 
 // QualityVerdict is the hold decision for one upstream stream.
@@ -90,6 +111,15 @@ func normalizeQualityRetry(cfg QualityRetryRuntime) QualityRetryRuntime {
 	if cfg.AccountCooldown <= 0 {
 		cfg.AccountCooldown = defaultMissingThinkingCooldown
 	}
+	if cfg.IdleAccountCooldown <= 0 {
+		cfg.IdleAccountCooldown = qualityIdleAccountCooldown
+	}
+	if cfg.MinEncryptedBytes <= 0 {
+		cfg.MinEncryptedBytes = defaultMinEncryptedBytes
+	}
+	if cfg.EncryptedBytesPerReasoningToken <= 0 {
+		cfg.EncryptedBytesPerReasoningToken = defaultEncryptedBytesPerReasoningToken
+	}
 	cfg.OnExhausted = normalizeQualityExhaustionPolicy(cfg.OnExhausted)
 	return cfg
 }
@@ -109,24 +139,114 @@ func (s *Service) qualityRetryConfig() QualityRetryRuntime {
 	return normalizeQualityRetry(QualityRetryRuntime{})
 }
 
+// encryptedThinkingFloor is max(minBytes, reasoningTokens*bytesPerToken).
+// A non-empty stub such as "gAAAA-cipher" is not thinking.
+func encryptedThinkingFloor(minBytes, bytesPerToken int, reasoningTokens int64) int64 {
+	if minBytes <= 0 {
+		minBytes = defaultMinEncryptedBytes
+	}
+	if bytesPerToken <= 0 {
+		bytesPerToken = defaultEncryptedBytesPerReasoningToken
+	}
+	floor := int64(minBytes)
+	if reasoningTokens > 0 {
+		if reasoningTokens > math.MaxInt64/int64(bytesPerToken) {
+			return math.MaxInt64
+		}
+		need := reasoningTokens * int64(bytesPerToken)
+		if need > floor {
+			floor = need
+		}
+	}
+	return floor
+}
+
+func qualityIsBurstDump(sig QualityStreamSignals, minOutput int64) bool {
+	visible := sig.VisibleTokens
+	floor := sig.EncryptedFloor
+	if floor <= 0 {
+		floor = encryptedThinkingFloor(0, 0, sig.ReasoningTokens)
+	}
+	barelyCeiling := int64(math.MaxInt64)
+	if floor <= math.MaxInt64/2 {
+		barelyCeiling = floor * 2
+	}
+	barelyCipher := sig.EncryptedBytes > 0 && int64(sig.EncryptedBytes) < barelyCeiling
+	flushed := sig.FirstVisible && sig.VisibleFlushMS >= 0 && sig.VisibleFlushMS < defaultBurstFlushMS
+	heavyReasoning := sig.ReasoningTokens >= defaultBurstMinReasoning
+	shortVisible := visible > 0 && visible < defaultBurstMaxVisible
+	// Hold timed out, then a short greeting dumped with a large reasoning bill
+	// (TUI "你好" after 30s / 954 thinking tokens).
+	if sig.HoldExpired && shortVisible && heavyReasoning {
+		return true
+	}
+	// Cipher met the floor so HasThinking is true, but visible tokens then
+	// dump in <1s with almost no answer (148 out / 140 reasoning in 0.7s).
+	if flushed && shortVisible && heavyReasoning {
+		return true
+	}
+	if barelyCipher && flushed && (visible >= minOutput || heavyReasoning) {
+		return true
+	}
+	return false
+}
+
 // ClassifyQualityHold decides whether a held stream may be forwarded.
-// Thinking (or reasoning tokens) always delivers. A finished or expired
-// sample with enough visible output and no reasoning is 降智 and withheld.
+// Streamed thinking delivers: reasoning/summary deltas, or a reasoning item
+// whose encrypted_content meets the ciphertext floor. A non-empty stub such
+// as "gAAAA-cipher" is not thinking. Usage.reasoning_tokens alone does not —
+// degraded upstreams fill that field without ciphertext or deltas. A finished
+// sample with enough visible output and no streamed thinking is withheld.
 // Short replies below minOutput are delivered so "ok"/"yes" is not retried.
 // A hold timeout with no visible output is not fail-open: keep waiting for
 // more bytes or a stream abort so an empty hang is not flushed as HTTP 200.
+//
+// An empty reasoning stub is not thinking. Before the hold deadline, wait for
+// real evidence or a terminal event. A stub plus enough visible output at the
+// deadline is withheld — that is the TUI dump after 30s, not late ciphertext.
+// Stub-only empty streams keep waiting for idle/terminal handling.
+// HasThinking that is only a thin ciphertext dump after the hold (or a
+// barely-over-floor flush in <1s) is still withheld.
 func ClassifyQualityHold(sig QualityStreamSignals, minOutput int64) QualityVerdict {
 	if minOutput <= 0 {
 		minOutput = defaultQualityMinOutput
 	}
-	if sig.HasThinking || sig.ReasoningTokens > 0 {
+	// Readable reasoning deltas are direct proof and can preserve the original
+	// low-latency release path. Ciphertext-only evidence remains provisional so
+	// the classifier can observe visible output and terminal usage regardless of
+	// how the SSE events were split across transport reads.
+	if sig.HasReasoningDelta {
 		return QualityDeliver
 	}
-	output := sig.OutputTokens
-	if output < sig.VisibleTokens {
-		output = sig.VisibleTokens
+	if sig.HasThinking {
+		if !sig.FirstVisible && !sig.Terminal {
+			return QualityWait
+		}
+		if qualityIsBurstDump(sig, minOutput) {
+			if sig.Terminal {
+				return QualityWithhold
+			}
+			return QualityWait
+		}
+		// The token-relative floor cannot be final until usage arrives. Preserve
+		// HoldTimeout as the fail-open latency bound for still-open streams.
+		if !sig.Terminal && !sig.HoldExpired && !sig.UsageReported {
+			return QualityWait
+		}
+		return QualityDeliver
+	}
+	// Prefer observed/derived visible output. Total output includes reasoning
+	// tokens, which are deliberately not trusted as quality evidence above. If
+	// the stream exposed no visible count at all, retain OutputTokens as a
+	// compatibility fallback for terminal usage-only responses.
+	output := sig.VisibleTokens
+	if output <= 0 {
+		output = sig.OutputTokens
 	}
 	enough := output >= minOutput
+	if sig.ReasoningStarted && !sig.Terminal && !sig.HoldExpired {
+		return QualityWait
+	}
 	if sig.Terminal {
 		if output <= 0 {
 			return QualityWait
@@ -142,6 +262,9 @@ func ClassifyQualityHold(sig QualityStreamSignals, minOutput int64) QualityVerdi
 	if sig.HoldExpired {
 		if output <= 0 {
 			return QualityWait
+		}
+		if enough {
+			return QualityWithhold
 		}
 		return QualityDeliver
 	}
@@ -172,16 +295,7 @@ func qualityPeekAbortError(ctx context.Context, err error) error {
 // isClientRequestCancel reports a real client disconnect. Upstream idle
 // timeouts cancel the same context and must not be classified as 499.
 func isClientRequestCancel(ctx context.Context, err error) bool {
-	if neterrorpkg.IsUpstreamStreamIdleTimeout(err) {
-		return false
-	}
-	if ctx != nil && neterrorpkg.IsUpstreamStreamIdleTimeout(context.Cause(ctx)) {
-		return false
-	}
-	if ctx != nil && ctx.Err() != nil {
-		return true
-	}
-	return errors.Is(err, context.Canceled)
+	return neterrorpkg.IsClientRequestCancel(ctx, err)
 }
 
 // DecideQualityRetry caps withhold recovery at maxAttempts (default 6:
@@ -253,7 +367,7 @@ func CommitQualityHold(verdict QualityVerdict, qualityAttempt, maxAttempts int, 
 }
 
 func shouldHoldQualityStream(input Input, ownership *inferencedomain.ResponseOwnership, route modeldomain.Route, operation audit.Operation, cfg QualityRetryRuntime) bool {
-	if !cfg.Enabled || !input.Streaming || input.ForcedEgressNodeID != 0 || ownership != nil {
+	if !cfg.Enabled || !input.Streaming || input.ForcedEgressNodeID != 0 || input.skipQualityHold {
 		return false
 	}
 	switch operation {
@@ -261,24 +375,20 @@ func shouldHoldQualityStream(input Input, ownership *inferencedomain.ResponseOwn
 	default:
 		return false
 	}
-	// TUI compaction is a normal /v1/responses body (no compaction_trigger).
-	// CreateResponse retags it to OperationCompaction; also skip here so a
-	// missed tag cannot withhold a 100s+ summary as missing-thinking.
+	// Context compaction is a system summary operation, not a normal reasoning
+	// turn. Holding it can quarantine a healthy account for producing the
+	// expected summary without streamed reasoning. Keep both compaction forms
+	// excluded even if a caller reaches this gate without skipQualityHold.
 	if isResponsesCompactionRequest(input.Body) {
 		return false
 	}
 	if route.Provider != accountdomain.ProviderBuild && route.Provider != accountdomain.ProviderConsole {
 		return false
 	}
-	// Retrying a tool-capable request can repeat external side effects. Tool
-	// requests remain outside this feature until they have their own replay
-	// safety contract.
-	if qualityRequestUsesTools(input.Body) {
-		return false
-	}
-	// Aliases are rewritten before this gate, so inspect the effective request
-	// body instead of only the reasoning-capable base model. In particular,
-	// grok-4.3-none becomes grok-4.3 plus an explicit disabled setting.
+	// TUI commonly declares tools and follow-ups carry previous_response_id.
+	// They still need quality classification, but replay safety is decided
+	// separately: detecting a degraded response must not imply that an
+	// account-bound or side-effecting request can run on another account.
 	if qualityRequestDisablesReasoning(input.Body) {
 		return false
 	}
@@ -288,12 +398,85 @@ func shouldHoldQualityStream(input Input, ownership *inferencedomain.ResponseOwn
 	return modeldomain.SupportsReasoningForProvider(route.Provider, route.UpstreamModel)
 }
 
-func qualityRequestUsesTools(body []byte) bool {
-	var payload map[string]json.RawMessage
-	if json.Unmarshal(body, &payload) != nil {
+// canReplayQualityHoldAcrossAccounts separates response classification from
+// retry authority. Stored Responses are account-bound, while hosted tools may
+// already have produced an external side effect before their held response is
+// rejected. Both may be held, audited, and penalized, but neither is replayed
+// on another account.
+func canReplayQualityHoldAcrossAccounts(input Input, ownership *inferencedomain.ResponseOwnership) bool {
+	return ownership == nil && !qualityRequestHasReplayUnsafeHostedTools(input.Body)
+}
+
+func qualityRequestHasReplayUnsafeHostedTools(body []byte) bool {
+	var payload map[string]any
+	if json.Unmarshal(body, &payload) != nil || payload == nil {
 		return false
 	}
-	return nonEmptyJSONCollection(payload["tools"]) || nonEmptyJSONCollection(payload["functions"])
+	if raw, exists := payload["web_search_options"]; exists && raw != nil {
+		return true
+	}
+	if raw, exists := payload["mcp_servers"]; exists && raw != nil {
+		servers, ok := raw.([]any)
+		if !ok || len(servers) > 0 {
+			return true
+		}
+	}
+	if qualityToolListHasReplayUnsafeHostedTool(payload["tools"]) {
+		return true
+	}
+	// Responses Tool Search can load declarations later in the request. Only
+	// inspect additional_tools items; arbitrary user/schema objects may also
+	// contain a field named "tools" and must not affect the retry policy.
+	items, _ := payload["input"].([]any)
+	for _, rawItem := range items {
+		item, ok := rawItem.(map[string]any)
+		if !ok || jsonNodeString(item["type"]) != "additional_tools" {
+			continue
+		}
+		if qualityToolListHasReplayUnsafeHostedTool(item["tools"]) {
+			return true
+		}
+	}
+	return false
+}
+
+func qualityToolListHasReplayUnsafeHostedTool(value any) bool {
+	tools, ok := value.([]any)
+	if !ok {
+		return false
+	}
+	for _, rawTool := range tools {
+		tool, ok := rawTool.(map[string]any)
+		if !ok {
+			continue
+		}
+		kind := jsonNodeString(tool["type"])
+		switch kind {
+		case "", "function", "custom", "local_shell", "apply_patch", "tool_search":
+			// These declarations only ask the model to return a call. Execution
+			// happens in the client after the held response is committed.
+			continue
+		case "shell":
+			environment, _ := tool["environment"].(map[string]any)
+			if jsonNodeString(environment["type"]) != "local" {
+				return true
+			}
+		case "namespace":
+			if qualityToolListHasReplayUnsafeHostedTool(tool["tools"]) {
+				return true
+			}
+		default:
+			// Default to no replay for every server/native tool, including types
+			// added by future protocol versions that this gateway does not know yet.
+			return true
+		}
+	}
+	return false
+}
+
+func jsonNodeString(value any) string {
+	text, _ := value.(string)
+	return strings.ToLower(strings.TrimSpace(text))
 }
 
 func qualityRequestDisablesReasoning(body []byte) bool {
@@ -318,14 +501,6 @@ func qualityRequestDisablesReasoning(body []byte) bool {
 		}
 	}
 	return jsonStringEquals(payload["thinking"], "disabled")
-}
-
-func nonEmptyJSONCollection(raw json.RawMessage) bool {
-	trimmed := strings.TrimSpace(string(raw))
-	if trimmed == "" || trimmed == "null" || trimmed == "[]" || trimmed == "{}" {
-		return false
-	}
-	return strings.HasPrefix(trimmed, "[") || strings.HasPrefix(trimmed, "{")
 }
 
 func jsonStringEquals(raw json.RawMessage, want string) bool {

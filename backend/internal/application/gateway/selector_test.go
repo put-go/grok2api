@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	accountapp "github.com/chenyme/grok2api/backend/internal/application/account"
 	"github.com/chenyme/grok2api/backend/internal/domain/account"
 	clientkeydomain "github.com/chenyme/grok2api/backend/internal/domain/clientkey"
 	egressdomain "github.com/chenyme/grok2api/backend/internal/domain/egress"
@@ -30,6 +31,7 @@ func TestSelectionUnavailableErrorClassification(t *testing.T) {
 		{reason: SelectionModelCooling, status: http.StatusTooManyRequests, code: "upstream_model_cooling"},
 		{reason: SelectionQuotaExhausted, status: http.StatusTooManyRequests, code: "upstream_quota_exhausted"},
 		{reason: SelectionSaturated, status: http.StatusServiceUnavailable, code: "upstream_saturated"},
+		{reason: SelectionPinnedUnavailable, status: http.StatusServiceUnavailable, code: "upstream_pinned_account_unavailable"},
 	}
 	for _, test := range tests {
 		t.Run(string(test.reason), func(t *testing.T) {
@@ -38,6 +40,43 @@ func TestSelectionUnavailableErrorClassification(t *testing.T) {
 				t.Fatalf("status=%d code=%q", failure.HTTPStatus(), failure.Code())
 			}
 		})
+	}
+}
+
+func TestAcquirePinnedMissingAccountIsNotEmptyPool(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "selector-pinned-miss.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	accounts := relational.NewAccountRepository(database)
+	live, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, Name: "live", SourceKey: "live", EncryptedAccessToken: "encrypted",
+		Enabled: true, AuthStatus: account.AuthStatusActive, MaxConcurrent: 4,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	selector := NewSelector(accounts, memory.NewConcurrencyLimiter(), memory.NewStickyStore(), nil, time.Hour, time.Second, time.Minute)
+	lease, err := selector.AcquireForKey(ctx, account.ProviderBuild, 0, "", "", "", nil, false, clientkeydomain.AccountScope{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lease.Credential.ID != live.ID {
+		t.Fatalf("pool account = %d", lease.Credential.ID)
+	}
+	lease.Release()
+	_, err = selector.AcquirePinnedForKey(ctx, account.ProviderBuild, live.ID+99, 0, "", "", true, clientkeydomain.AccountScope{})
+	var unavailable *SelectionUnavailableError
+	if !errors.As(err, &unavailable) || unavailable.Reason != SelectionPinnedUnavailable || unavailable.AccountID != live.ID+99 {
+		t.Fatalf("pinned miss = %v", err)
+	}
+	if unavailable.Code() == "upstream_unavailable" {
+		t.Fatal("pinned miss must not collapse to empty-pool unavailable")
 	}
 }
 
@@ -141,9 +180,85 @@ func TestSelectorQualityProbePinsAccountToRequestedEgressNode(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer lease.Release()
 	if lease.Credential.ID != second.ID || lease.Credential.ID == first.ID {
 		t.Fatalf("selected account=%d, want=%d on node=%d", lease.Credential.ID, second.ID, secondNode.ID)
+	}
+	lease.Release()
+
+	if _, err := accounts.UpsertEgressLeaseBlock(ctx, account.EgressLeaseBlock{
+		AccountID: second.ID, NodeID: secondNode.ID, Reason: "hard_tps", Version: "selector-lease-0001", CooldownUntil: time.Now().UTC().Add(time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	selector = NewSelector(accounts, memory.NewConcurrencyLimiter(), memory.NewStickyStore(), nil, time.Hour, time.Second, time.Minute)
+	if _, err := selector.AcquirePinnedForKey(ctx, account.ProviderBuild, second.ID, 0, "grok-test", "", true, clientkeydomain.AccountScope{}); err == nil {
+		t.Fatal("ordinary pinned inference ignored the active egress lease block")
+	} else {
+		var unavailable *SelectionUnavailableError
+		if !errors.As(err, &unavailable) || unavailable.Reason != SelectionCooling {
+			t.Fatalf("ordinary pinned error = %v", err)
+		}
+	}
+	recoveryLease, err := selector.AcquirePinnedForQualityProbe(ctx, account.ProviderBuild, second.ID, 0, "grok-test", "", clientkeydomain.AccountScope{})
+	if err != nil {
+		t.Fatalf("quality recovery did not bypass only the lease block: %v", err)
+	}
+	defer recoveryLease.Release()
+	if recoveryLease.Credential.ID != second.ID || recoveryLease.Credential.EgressNodeID != secondNode.ID {
+		t.Fatalf("quality recovery lease = %#v", recoveryLease.Credential)
+	}
+}
+
+func TestSelectorCoolsUnboundAccountOnObservedLeaseAndAllowsRecoveryProbe(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "selector-dynamic-egress.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	egressNodes := relational.NewEgressRepository(database)
+	node, err := egressNodes.CreateEgressNode(ctx, egressdomain.Node{
+		Name: "dynamic", Scope: egressdomain.ScopeBuild, Enabled: true, EncryptedProxyURL: "encrypted",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	accounts := relational.NewAccountRepository(database)
+	credential, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, Name: "unbound", SourceKey: "unbound", EncryptedAccessToken: "encrypted",
+		Enabled: true, AuthStatus: account.AuthStatusActive, MaxConcurrent: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if credential.EgressNodeID != 0 {
+		t.Fatalf("test account unexpectedly bound to node %d", credential.EgressNodeID)
+	}
+	if _, err := accounts.UpsertEgressLeaseBlock(ctx, account.EgressLeaseBlock{
+		AccountID: credential.ID, NodeID: node.ID, Reason: "hard_tps", Version: "selector-dynamic-0001", CooldownUntil: time.Now().UTC().Add(time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	selector := NewSelector(accounts, memory.NewConcurrencyLimiter(), memory.NewStickyStore(), nil, time.Hour, time.Second, time.Minute)
+	if _, err := selector.AcquirePinnedForKey(ctx, account.ProviderBuild, credential.ID, 0, "grok-test", "", true, clientkeydomain.AccountScope{}); err == nil {
+		t.Fatal("ordinary inference ignored the unbound account's active observed lease")
+	} else {
+		var unavailable *SelectionUnavailableError
+		if !errors.As(err, &unavailable) || unavailable.Reason != SelectionCooling {
+			t.Fatalf("ordinary pinned error = %v", err)
+		}
+	}
+	recoveryLease, err := selector.AcquirePinnedForQualityProbe(ctx, account.ProviderBuild, credential.ID, 0, "grok-test", "", clientkeydomain.AccountScope{})
+	if err != nil {
+		t.Fatalf("quality recovery did not bypass the observed lease block: %v", err)
+	}
+	defer recoveryLease.Release()
+	if recoveryLease.Credential.ID != credential.ID || recoveryLease.Credential.EgressNodeID != 0 {
+		t.Fatalf("quality recovery lease = %#v", recoveryLease.Credential)
 	}
 }
 
@@ -722,9 +837,13 @@ func TestSelectorWebCatalogCapabilityStillEnforcesTier(t *testing.T) {
 }
 
 func TestImageQuotaFinalizationKeepsEffectiveConsumptionFence(t *testing.T) {
-	refreshMode, decrementMode := quotaFinalizationModes(account.QuotaModeWebImagePro, account.QuotaGroupWebImagine)
-	if refreshMode != account.QuotaGroupWebImagine || decrementMode != account.QuotaModeWebImagePro {
-		t.Fatalf("refresh=%q decrement=%q", refreshMode, decrementMode)
+	refreshMode, decrementMode, availabilityMode := quotaFinalizationModes(account.QuotaModeWebImagePro, account.QuotaGroupWebImagine)
+	if refreshMode != account.QuotaGroupWebImagine || decrementMode != account.QuotaModeWebImagePro || availabilityMode != "" {
+		t.Fatalf("refresh=%q decrement=%q availability=%q", refreshMode, decrementMode, availabilityMode)
+	}
+	refreshMode, decrementMode, availabilityMode = quotaFinalizationModes("weekly", account.QuotaGroupWebImagine)
+	if refreshMode != "weekly" || decrementMode != "weekly" || availabilityMode != account.QuotaGroupWebImagine {
+		t.Fatalf("shared weekly refresh=%q decrement=%q availability=%q", refreshMode, decrementMode, availabilityMode)
 	}
 }
 
@@ -1685,7 +1804,48 @@ func TestMarkFailureSoftNetworkCooldown(t *testing.T) {
 	}
 
 	before = time.Now().UTC()
-	selector.MarkFailure(ctx, hard, 0, 0)
+	if err := selector.markSoftFailure(ctx, hard, http.StatusGatewayTimeout, 0); err != nil {
+		t.Fatal(err)
+	}
+	soft5xx, err := accounts.Get(ctx, credential.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if soft5xx.FailureCount != hard.FailureCount {
+		t.Fatalf("soft 5xx failure count = %d, want preserved %d", soft5xx.FailureCount, hard.FailureCount)
+	}
+	if soft5xx.LastError != "upstream status 504" {
+		t.Fatalf("soft 5xx diagnostic = %q", soft5xx.LastError)
+	}
+	if soft5xx.CooldownUntil == nil {
+		t.Fatal("soft 5xx did not set cooldown")
+	}
+	cooldown = soft5xx.CooldownUntil.Sub(before)
+	if cooldown < 4*time.Second || cooldown > 6*time.Second {
+		t.Fatalf("soft 5xx cooldown = %s, want ~5s", cooldown)
+	}
+
+	before = time.Now().UTC()
+	if err := selector.markSoftFailure(ctx, soft5xx, http.StatusServiceUnavailable, 12*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	softRetryAfter, err := accounts.Get(ctx, credential.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if softRetryAfter.FailureCount != hard.FailureCount {
+		t.Fatalf("Retry-After soft failure count = %d, want preserved %d", softRetryAfter.FailureCount, hard.FailureCount)
+	}
+	if softRetryAfter.CooldownUntil == nil {
+		t.Fatal("Retry-After soft failure did not set cooldown")
+	}
+	cooldown = softRetryAfter.CooldownUntil.Sub(before)
+	if cooldown < 11*time.Second || cooldown > 13*time.Second {
+		t.Fatalf("Retry-After soft cooldown = %s, want ~12s", cooldown)
+	}
+
+	before = time.Now().UTC()
+	selector.MarkFailure(ctx, softRetryAfter, 0, 0)
 	preserved, err := accounts.Get(ctx, credential.ID)
 	if err != nil {
 		t.Fatal(err)
@@ -1718,6 +1878,74 @@ func TestMarkFailureSoftNetworkCooldown(t *testing.T) {
 	cooldown = reset.CooldownUntil.Sub(before)
 	if cooldown < 4*time.Second || cooldown > 6*time.Second {
 		t.Fatalf("after-success soft cooldown = %s, want ~5s", cooldown)
+	}
+}
+
+func TestConsoleRateLimitReconciliationUsesNonAccumulatingCooldown(t *testing.T) {
+	tests := []struct {
+		name             string
+		status           int
+		state            accountapp.RateLimitReconcileState
+		err              error
+		wantFailureCount int
+	}{
+		{name: "quota confirmed available", status: http.StatusTooManyRequests, state: accountapp.RateLimitReconcileAvailable, wantFailureCount: 3},
+		{name: "another replica refreshing", status: http.StatusTooManyRequests, state: accountapp.RateLimitReconcileRefreshing, wantFailureCount: 3},
+		{name: "quota probe inconclusive", status: http.StatusTooManyRequests, state: accountapp.RateLimitReconcileInconclusive, err: errors.New("usage probe failed"), wantFailureCount: 3},
+		{name: "payment failure keeps hard penalty", status: http.StatusPaymentRequired, state: accountapp.RateLimitReconcileAvailable, wantFailureCount: 4},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "console-rate-limit-soft.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = database.Close() })
+			if err := database.InitializeSchema(ctx); err != nil {
+				t.Fatal(err)
+			}
+			accounts := relational.NewAccountRepository(database)
+			credential, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
+				Provider: account.ProviderConsole, AuthType: account.AuthTypeSSO,
+				Name: "console-soft", SourceKey: "console-soft", EncryptedAccessToken: "encrypted",
+				Enabled: true, AuthStatus: account.AuthStatusActive,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := accounts.UpdateHealth(ctx, credential.ID, credential.Provider, 3, nil, "prior failures", false); err != nil {
+				t.Fatal(err)
+			}
+			credential, err = accounts.Get(ctx, credential.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			selector := NewSelector(accounts, memory.NewConcurrencyLimiter(), memory.NewStickyStore(), nil, time.Hour, 30*time.Second, 30*time.Minute, 500*time.Millisecond)
+			service := &Service{selector: selector}
+			before := time.Now().UTC()
+
+			service.applyRateLimitReconciliation(ctx, credential, test.status, 12*time.Second, test.state, test.err)
+
+			updated, err := accounts.Get(ctx, credential.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if updated.FailureCount != test.wantFailureCount {
+				t.Fatalf("failure count = %d, want %d", updated.FailureCount, test.wantFailureCount)
+			}
+			if updated.CooldownUntil == nil {
+				t.Fatal("expected Console 429 cooldown")
+			}
+			cooldown := updated.CooldownUntil.Sub(before)
+			if test.status == http.StatusTooManyRequests {
+				if cooldown < 11*time.Second || cooldown > 13*time.Second {
+					t.Fatalf("cooldown = %s, want ~12s", cooldown)
+				}
+			} else if cooldown < 2*time.Minute {
+				t.Fatalf("hard failure cooldown = %s, want at least 2m", cooldown)
+			}
+		})
 	}
 }
 

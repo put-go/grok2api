@@ -21,6 +21,7 @@ import (
 	"github.com/chenyme/grok2api/backend/internal/infra/provider/conversation"
 	providerstreamidle "github.com/chenyme/grok2api/backend/internal/infra/provider/streamidle"
 	"github.com/chenyme/grok2api/backend/internal/infra/security"
+	neterrorpkg "github.com/chenyme/grok2api/backend/internal/pkg/neterror"
 )
 
 type Config struct {
@@ -86,6 +87,8 @@ func (a *Adapter) QuotaMode(upstreamModel string) string {
 
 func (a *Adapter) TierGroups(string) account.WebTierGroups { return nil }
 
+func (a *Adapter) TierOrder(string) []account.WebTier { return nil }
+
 func (a *Adapter) PricingModel(upstreamModel string) string { return upstreamModel }
 
 func (a *Adapter) ListModels(context.Context, account.Credential) ([]string, error) {
@@ -136,7 +139,7 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 	cfg := a.config()
 	requestCtx, totalCancel := context.WithTimeout(ctx, time.Duration(cfg.TimeoutSeconds)*time.Second)
 	var idleCancel context.CancelCauseFunc
-	if request.Streaming && cfg.StreamIdleTimeoutSeconds > 0 {
+	if cfg.StreamIdleTimeoutSeconds > 0 {
 		requestCtx, idleCancel = context.WithCancelCause(requestCtx)
 	}
 	cancel := func() {
@@ -157,7 +160,7 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 		cancel()
 		return nil, err
 	}
-	if request.Streaming && idleCancel != nil && response.StatusCode >= 200 && response.StatusCode < 300 && response.Body != nil {
+	if idleCancel != nil && response.StatusCode >= 200 && response.StatusCode < 300 && response.Body != nil {
 		response.Body = providerstreamidle.New(response.Body, time.Duration(cfg.StreamIdleTimeoutSeconds)*time.Second, idleCancel)
 	}
 	responseBodyTruncated := false
@@ -225,6 +228,9 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 		release()
 		if readErr != nil {
 			return nil, readErr
+		}
+		if response.StatusCode >= 200 && response.StatusCode < 300 && len(bytes.TrimSpace(data)) == 0 {
+			return nil, neterrorpkg.ErrUpstreamResponseEmpty
 		}
 		if response.StatusCode >= 200 && response.StatusCode < 300 && len(data) > 64<<20 {
 			return nil, fmt.Errorf("Console 对话响应超过 64 MiB")

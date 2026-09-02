@@ -49,7 +49,8 @@ func (s *Selector) nextSegmentedActiveRequest(provider account.Provider, upstrea
 	return &segmentedSelectorActiveRequest{provider: provider, windowSize: config.windowSize, cursor: cursor}
 }
 
-func (s *Selector) acquireSegmentedCandidates(ctx context.Context, values []account.RoutingCandidate, indexes []int, quotaMode string, tierGroups account.WebTierGroups, request segmentedSelectorActiveRequest) (*accountLease, error) {
+func (s *Selector) acquireSegmentedCandidates(ctx context.Context, values []account.RoutingCandidate, indexes []int, quotaMode string, tierPolicy any, request segmentedSelectorActiveRequest, materialFailures *credentialMaterialFailureTracker) (*accountLease, error) {
+	tierGroups := normalizeTierGroups(tierPolicy)
 	startedAt := time.Now()
 	_, _, _, capacityWait := s.routingConfig()
 	waitDeadline := time.Now().Add(capacityWait)
@@ -70,7 +71,7 @@ func (s *Selector) acquireSegmentedCandidates(ctx context.Context, values []acco
 				observeSegmentedActive(request.provider, "error", "full_fallback", startedAt, windowsScanned, candidatesScanned)
 				return nil, err
 			}
-			claim, err := s.claimSegmentedPlan(ctx, plan, request.provider, quotaMode, "full_fallback")
+			claim, err := s.claimSegmentedPlan(ctx, plan, request.provider, quotaMode, "full_fallback", materialFailures)
 			if err != nil {
 				observeSegmentedActive(request.provider, "error", "full_fallback", startedAt, windowsScanned, candidatesScanned)
 				return nil, err
@@ -100,7 +101,7 @@ func (s *Selector) acquireSegmentedCandidates(ctx context.Context, values []acco
 						return nil, err
 					}
 					stage := segmentedActiveSelectionStage(cohortIndex, windowOffset)
-					claim, err := s.claimSegmentedPlan(ctx, plan, request.provider, quotaMode, stage)
+					claim, err := s.claimSegmentedPlan(ctx, plan, request.provider, quotaMode, stage, materialFailures)
 					if err != nil {
 						observeSegmentedActive(request.provider, "error", "claim", startedAt, windowsScanned, candidatesScanned)
 						return nil, err
@@ -129,7 +130,7 @@ func (s *Selector) acquireSegmentedCandidates(ctx context.Context, values []acco
 					observeSegmentedActive(request.provider, "error", "full_fallback", startedAt, windowsScanned, candidatesScanned)
 					return nil, err
 				}
-				claim, err := s.claimSegmentedPlan(ctx, plan, request.provider, quotaMode, "full_fallback")
+				claim, err := s.claimSegmentedPlan(ctx, plan, request.provider, quotaMode, "full_fallback", materialFailures)
 				if err != nil {
 					observeSegmentedActive(request.provider, "error", "full_fallback", startedAt, windowsScanned, candidatesScanned)
 					return nil, err
@@ -161,10 +162,10 @@ func (s *Selector) acquireSegmentedCandidates(ctx context.Context, values []acco
 	}
 }
 
-func (s *Selector) claimSegmentedPlan(ctx context.Context, plan *candidatePlan, provider account.Provider, quotaMode, stage string) (segmentedClaimResult, error) {
+func (s *Selector) claimSegmentedPlan(ctx context.Context, plan *candidatePlan, provider account.Provider, quotaMode, stage string, materialFailures *credentialMaterialFailureTracker) (segmentedClaimResult, error) {
 	result := segmentedClaimResult{}
 	for candidate, ok := plan.Next(); ok; candidate, ok = plan.Next() {
-		lease, err := s.claimAccountSlot(ctx, candidate.Credential)
+		lease, err := s.claimAccountSlotTracked(ctx, candidate.Credential, materialFailures)
 		if err != nil {
 			if errors.Is(err, errRoutingCredentialStale) {
 				result.staleClaims++
@@ -187,7 +188,8 @@ func (s *Selector) claimSegmentedPlan(ctx context.Context, plan *candidatePlan, 
 	return result, nil
 }
 
-func segmentedCandidateCohorts(values []account.RoutingCandidate, indexes []int, now time.Time, tierGroups account.WebTierGroups, preferFreeBuild bool, windowOptions ...int) []segmentedSelectorCohortBucket {
+func segmentedCandidateCohorts(values []account.RoutingCandidate, indexes []int, now time.Time, tierPolicy any, preferFreeBuild bool, windowOptions ...int) []segmentedSelectorCohortBucket {
+	tierGroups := normalizeTierGroups(tierPolicy)
 	cohortFor := func(index int) segmentedSelectorCohort {
 		candidate := values[index]
 		tierRank, _ := tierGroups.Rank(candidate.Credential.WebTier)

@@ -1,7 +1,9 @@
 package inference
 
 import (
+	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -325,6 +327,9 @@ func (h *Handler) createChatCompletion(c *gin.Context) {
 		PromptCacheSeed:           extractPromptCacheSeed(c.Request.Header, body),
 		AllowClientToolCacheRoute: allowBuildClientToolCacheRoute(c.Request.Header),
 		GrokTurnIndex:             c.GetHeader("x-grok-turn-idx"),
+		Method:                    c.Request.Method,
+		Path:                      c.Request.URL.Path,
+		Headers:                   c.Request.Header.Clone(),
 	})
 	if err != nil {
 		writeGatewayError(c, err)
@@ -367,6 +372,9 @@ func (h *Handler) createMessage(c *gin.Context) {
 		PromptCacheSeed:           extractPromptCacheSeed(c.Request.Header, body),
 		AllowClientToolCacheRoute: allowBuildClientToolCacheRoute(c.Request.Header),
 		GrokTurnIndex:             c.GetHeader("x-grok-turn-idx"),
+		Method:                    c.Request.Method,
+		Path:                      c.Request.URL.Path,
+		Headers:                   c.Request.Header.Clone(),
 	})
 	if err != nil {
 		writeGatewayAnthropicError(c, err)
@@ -381,8 +389,13 @@ func (h *Handler) generateImage(c *gin.Context) {
 		writeOpenAIError(c, http.StatusUnsupportedMediaType, "invalid_request", "图片生成仅支持 application/json")
 		return
 	}
+	body, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		writeOpenAIError(c, http.StatusRequestEntityTooLarge, "request_too_large", "请求体超过限制")
+		return
+	}
 	var request imageGenerationRequest
-	if decodeSingleJSON(c.Request.Body, &request, false) != nil || strings.TrimSpace(request.Model) == "" || strings.TrimSpace(request.Prompt) == "" {
+	if decodeSingleJSON(bytes.NewReader(body), &request, false) != nil || strings.TrimSpace(request.Model) == "" || strings.TrimSpace(request.Prompt) == "" {
 		writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "图片请求缺少有效 model 或 prompt")
 		return
 	}
@@ -428,6 +441,7 @@ func (h *Handler) generateImage(c *gin.Context) {
 		Count: count, Size: request.Size, AspectRatio: request.AspectRatio,
 		Resolution: request.Resolution, Quality: quality, ResponseFormat: request.ResponseFormat,
 		Streaming: request.Stream, PartialImages: partialImages,
+		Method: c.Request.Method, Path: c.Request.URL.Path, Headers: c.Request.Header.Clone(),
 	})
 	if err != nil {
 		writeGatewayError(c, err)
@@ -572,8 +586,13 @@ func (h *Handler) editImage(c *gin.Context) {
 		writeOpenAIError(c, http.StatusUnsupportedMediaType, "invalid_request", "图片编辑仅支持 application/json")
 		return
 	}
+	body, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		writeOpenAIError(c, http.StatusRequestEntityTooLarge, "request_too_large", "请求体超过限制")
+		return
+	}
 	var request imageEditJSONRequest
-	if err := decodeSingleJSON(c.Request.Body, &request, false); err != nil {
+	if err := decodeSingleJSON(bytes.NewReader(body), &request, false); err != nil {
 		writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "图片编辑 JSON 请求无效")
 		return
 	}
@@ -661,6 +680,7 @@ func (h *Handler) editImage(c *gin.Context) {
 		ImageURLs: imageURLs, Count: count, Size: size, AspectRatio: aspectRatio,
 		Resolution: resolution, Quality: quality, ResponseFormat: request.ResponseFormat,
 		Streaming: request.Stream, PartialImages: partialImages,
+		Method: c.Request.Method, Path: c.Request.URL.Path, Headers: c.Request.Header.Clone(),
 	})
 	if err != nil {
 		writeGatewayError(c, err)
@@ -1150,6 +1170,9 @@ func (h *Handler) handleCreate(c *gin.Context, compact bool) {
 		PromptCacheSeed: extractPromptCacheSeed(c.Request.Header, body), PreviousResponseID: request.PreviousResponseID,
 		AllowClientToolCacheRoute: allowBuildClientToolCacheRoute(c.Request.Header),
 		GrokTurnIndex:             c.GetHeader("x-grok-turn-idx"),
+		Method:                    c.Request.Method,
+		Path:                      c.Request.URL.Path,
+		Headers:                   c.Request.Header.Clone(),
 	}
 	var result *gateway.Result
 	if compact {
@@ -1161,7 +1184,7 @@ func (h *Handler) handleCreate(c *gin.Context, compact bool) {
 		writeGatewayError(c, err)
 		return
 	}
-	h.writeResult(c, result, request.Stream && !compact, streamProtocolResponses)
+	h.writeResponsesResult(c, result, request.Stream && !compact, request.Model)
 }
 
 func isJSONRequest(c *gin.Context) bool {
@@ -1221,14 +1244,18 @@ func (h *Handler) handleOwnedResource(c *gin.Context, deleteResource bool) {
 }
 
 func (h *Handler) writeResult(c *gin.Context, result *gateway.Result, stream bool, protocol streamProtocol) {
-	h.writeProtocolResult(c, result, stream, false, protocol)
+	h.writeProtocolResult(c, result, stream, false, protocol, "")
+}
+
+func (h *Handler) writeResponsesResult(c *gin.Context, result *gateway.Result, stream bool, fallbackModel string) {
+	h.writeProtocolResult(c, result, stream, false, streamProtocolResponses, fallbackModel)
 }
 
 func (h *Handler) writeAnthropicResult(c *gin.Context, result *gateway.Result, stream bool) {
-	h.writeProtocolResult(c, result, stream, true, streamProtocolAnthropic)
+	h.writeProtocolResult(c, result, stream, true, streamProtocolAnthropic, "")
 }
 
-func (h *Handler) writeProtocolResult(c *gin.Context, result *gateway.Result, stream, anthropic bool, protocol streamProtocol) {
+func (h *Handler) writeProtocolResult(c *gin.Context, result *gateway.Result, stream, anthropic bool, protocol streamProtocol, fallbackModel string) {
 	usage := gateway.Usage{}
 	responseID := ""
 	errorCode := ""
@@ -1244,6 +1271,27 @@ func (h *Handler) writeProtocolResult(c *gin.Context, result *gateway.Result, st
 		}
 		return
 	}
+	body := io.Reader(result.Body)
+	if !stream && result.StatusCode >= http.StatusOK && result.StatusCode < http.StatusMultipleChoices {
+		var peekErr error
+		body, peekErr = peekNonEmptyJSONBody(result.Body)
+		if peekErr != nil {
+			status, code, message := http.StatusBadGateway, "stream_interrupted", "读取上游响应失败"
+			switch {
+			case neterror.IsUpstreamStreamIdleTimeout(peekErr):
+				status, code, message = http.StatusGatewayTimeout, "upstream_stream_idle_timeout", "上游响应长时间无数据"
+			case neterror.IsUpstreamResponseEmpty(peekErr):
+				status, code, message = http.StatusBadGateway, "upstream_response_empty", "上游响应为空"
+			}
+			errorCode = code
+			if anthropic {
+				writeAnthropicError(c, status, "api_error", message, code)
+			} else {
+				writeOpenAIError(c, status, code, message)
+			}
+			return
+		}
+	}
 	transferLimit := int64(maxJSONResponseTransferBytes)
 	if stream {
 		transferLimit = maxStreamResponseTransferBytes
@@ -1254,37 +1302,101 @@ func (h *Handler) writeProtocolResult(c *gin.Context, result *gateway.Result, st
 		return
 	}
 	copyHeaders(c.Writer.Header(), result.Header)
-	c.Status(result.StatusCode)
 	if result.StatusCode >= 400 {
 		errorCode = "upstream_error"
+		if stream && !isEventStreamContentType(result.Header.Get("Content-Type")) {
+			raw, readErr := io.ReadAll(io.LimitReader(result.Body, maxJSONResponseTransferBytes+1))
+			if readErr != nil {
+				if anthropic {
+					writeAnthropicError(c, http.StatusBadGateway, "api_error", "读取上游错误响应失败", "upstream_error")
+				} else {
+					writeOpenAIError(c, http.StatusBadGateway, "upstream_error", "读取上游错误响应失败")
+				}
+				return
+			}
+			c.Writer.Header().Del("Content-Length")
+			code, message := gateway.ClassifyUpstreamHTTPError(result.StatusCode, raw)
+			errorCode = code
+			if anthropic {
+				writeAnthropicError(c, result.StatusCode, anthropicUpstreamHTTPErrorType(result.StatusCode), message, errorCode)
+			} else {
+				writeOpenAIError(c, result.StatusCode, errorCode, message)
+			}
+			return
+		}
 	}
+	c.Status(result.StatusCode)
 	var err error
 	if stream {
-		metadata, copyErr := copyStream(c.Writer, result.Body, protocol, result.MarkFirstToken)
+		metadata, copyErr := copyStreamWithFallbackModel(c.Writer, result.Body, protocol, result.MarkFirstToken, fallbackModel)
 		usage, responseID, err = metadata.Usage, metadata.ResponseID, copyErr
 		if metadata.StreamFailure != nil && result.RecordStreamFailure != nil {
 			result.RecordStreamFailure(*metadata.StreamFailure)
 		}
 	} else {
-		metadata, copyErr := copyJSON(c.Writer, result.Body, protocol)
+		metadata, copyErr := copyJSON(c.Writer, body, protocol)
 		usage, responseID, err = metadata.Usage, metadata.ResponseID, copyErr
 	}
 	if err != nil {
-		switch {
-		case errors.Is(err, errResponseTransferLimit):
-			errorCode = "response_too_large"
-		case errors.Is(err, errUpstreamStreamFailed):
-			errorCode = "upstream_stream_error"
-		case errors.Is(err, errUpstreamStreamIncomplete):
-			errorCode = "upstream_stream_incomplete"
-		case errors.Is(err, neterror.ErrUpstreamStreamIdleTimeout):
-			errorCode = "upstream_stream_idle_timeout"
-		case errors.Is(err, errUpstreamStreamRead):
-			errorCode = "upstream_stream_interrupted"
-		default:
-			errorCode = "stream_interrupted"
-		}
+		errorCode = classifyCopyError(c.Request.Context(), err)
 	}
+}
+
+func anthropicUpstreamHTTPErrorType(status int) string {
+	switch status {
+	case http.StatusBadRequest, http.StatusConflict, http.StatusUnprocessableEntity:
+		return "invalid_request_error"
+	case http.StatusNotFound:
+		return "not_found_error"
+	case http.StatusTooManyRequests:
+		return "rate_limit_error"
+	case http.StatusRequestTimeout, http.StatusGatewayTimeout:
+		return "timeout_error"
+	default:
+		return "api_error"
+	}
+}
+
+func classifyCopyError(ctx context.Context, err error) string {
+	if err == nil {
+		return ""
+	}
+	if neterror.IsClientRequestCancel(ctx, err) {
+		return "client_stream_interrupted"
+	}
+	switch {
+	case errors.Is(err, errResponseTransferLimit):
+		return "response_too_large"
+	case errors.Is(err, errUpstreamStreamFailed):
+		return "upstream_stream_error"
+	case errors.Is(err, errUpstreamStreamIncomplete):
+		return "upstream_stream_incomplete"
+	case errors.Is(err, neterror.ErrUpstreamStreamIdleTimeout):
+		return "upstream_stream_idle_timeout"
+	case errors.Is(err, neterror.ErrUpstreamResponseEmpty):
+		return "upstream_response_empty"
+	case errors.Is(err, neterror.ErrUpstreamOutputLoop):
+		return "upstream_output_loop"
+	case errors.Is(err, errUpstreamStreamRead):
+		return "upstream_stream_interrupted"
+	default:
+		return "stream_interrupted"
+	}
+}
+
+// peekNonEmptyJSONBody delays the downstream 2xx status until the upstream has
+// produced at least one response byte. This lets an idle/empty non-streaming
+// response become a real 502/504 instead of an empty 200 while preserving a
+// streaming copy for large valid JSON bodies.
+func peekNonEmptyJSONBody(source io.Reader) (io.Reader, error) {
+	reader := bufio.NewReaderSize(source, responseCopyBufferBytes)
+	if _, err := reader.Peek(1); err != nil {
+		if errors.Is(err, io.EOF) {
+			return nil, neterror.ErrUpstreamResponseEmpty
+		}
+		return nil, err
+	}
+	return reader, nil
 }
 
 type responseMetadata struct {
@@ -1297,9 +1409,14 @@ type responseMetadata struct {
 }
 
 func copyStream(writer gin.ResponseWriter, source io.Reader, protocol streamProtocol, onFirstToken func()) (responseMetadata, error) {
+	return copyStreamWithFallbackModel(writer, source, protocol, onFirstToken, "")
+}
+
+func copyStreamWithFallbackModel(writer gin.ResponseWriter, source io.Reader, protocol streamProtocol, onFirstToken func(), fallbackModel string) (responseMetadata, error) {
 	inspector := &responseInspector{protocol: protocol, onFirstToken: onFirstToken}
-	markerFilter := internalSSEMarkerFilter{enabled: protocol == streamProtocolChat}
+	markerFilter := internalSSEMarkerFilter{enabled: protocol == streamProtocolChat || protocol == streamProtocolAnthropic}
 	var compat responsesCompatState
+	compat.model = strings.TrimSpace(fallbackModel)
 	buffer := make([]byte, responseCopyBufferBytes)
 	received := 0
 	transferred := 0
@@ -1405,6 +1522,8 @@ func streamAbortTrailer(protocol streamProtocol, cause error, meta responseMetad
 	switch {
 	case errors.Is(cause, neterror.ErrUpstreamStreamIdleTimeout):
 		code, message = "upstream_stream_idle_timeout", "上游流式响应长时间无数据"
+	case errors.Is(cause, neterror.ErrUpstreamOutputLoop):
+		code, message = "upstream_output_loop", "上游输出陷入循环"
 	case errors.Is(cause, errUpstreamStreamIncomplete):
 		code, message = "upstream_stream_incomplete", "上游流式响应未完整结束"
 	}
@@ -1428,21 +1547,29 @@ func streamAbortTrailer(protocol streamProtocol, cause error, meta responseMetad
 		}
 		compat.rememberFromMeta(meta)
 		id := compat.ensureID()
-		response := map[string]any{
-			"id":                 id,
-			"object":             "response",
-			"created_at":         compat.createdAt,
-			"completed_at":       compat.createdAt,
-			"status":             "incomplete",
-			"output":             []any{},
-			"error":              nil,
-			"incomplete_details": map[string]any{"reason": code},
+		// Grok TUI 0.2.93 treats any response.incomplete as fatal
+		// max_tokens_truncation (not retryable), ignoring incomplete_details.reason.
+		// Stream aborts are transport failures — emit response.failed so the
+		// client can retry instead of killing the turn.
+		model := strings.TrimSpace(meta.Model)
+		if model == "" {
+			model = strings.TrimSpace(compat.model)
 		}
-		if model := strings.TrimSpace(meta.Model); model != "" {
-			response["model"] = model
+		response := map[string]any{
+			"id":           id,
+			"object":       "response",
+			"created_at":   compat.createdAt,
+			"completed_at": compat.createdAt,
+			"status":       "failed",
+			"model":        model,
+			"output":       []any{},
+			"error": map[string]any{
+				"code":    "server_error",
+				"message": code + ": " + message,
+			},
 		}
 		event := map[string]any{
-			"type":            "response.incomplete",
+			"type":            "response.failed",
 			"id":              id,
 			"sequence_number": meta.SequenceNumber + 1,
 			"response":        response,
@@ -1452,11 +1579,15 @@ func streamAbortTrailer(protocol streamProtocol, cause error, meta responseMetad
 		if err != nil {
 			return nil
 		}
-		return []byte("event: response.incomplete\ndata: " + string(payload) + "\n\n")
+		return []byte("event: response.failed\ndata: " + string(payload) + "\n\n")
 	case streamProtocolAnthropic:
+		anthropicMessage := message
+		if code == "upstream_output_loop" {
+			anthropicMessage = code + ": " + message
+		}
 		payload, err := json.Marshal(map[string]any{
 			"type":  "error",
-			"error": map[string]any{"type": "api_error", "message": message},
+			"error": map[string]any{"type": "api_error", "message": anthropicMessage},
 		})
 		if err != nil {
 			return nil
@@ -1476,13 +1607,13 @@ func (f *internalSSEMarkerFilter) Filter(chunk []byte, final bool) []byte {
 	if !f.enabled {
 		return chunk
 	}
-	marker := []byte(reasoningStartSSEComment + "\n\n")
 	f.pending = append(f.pending, chunk...)
 	result := make([]byte, 0, len(f.pending))
 	for {
-		if index := bytes.Index(f.pending, marker); index >= 0 {
+		index, markerLength := nextInternalSSEMarker(f.pending)
+		if index >= 0 {
 			result = append(result, f.pending[:index]...)
-			f.pending = f.pending[index+len(marker):]
+			f.pending = f.pending[index+markerLength:]
 			continue
 		}
 		if final {
@@ -1491,17 +1622,32 @@ func (f *internalSSEMarkerFilter) Filter(chunk []byte, final bool) []byte {
 			return result
 		}
 		keep := 0
-		limit := min(len(f.pending), len(marker)-1)
-		for size := limit; size > 0; size-- {
-			if bytes.Equal(f.pending[len(f.pending)-size:], marker[:size]) {
-				keep = size
-				break
+		for _, marker := range internalSSEMarkers {
+			limit := min(len(f.pending), len(marker)-1)
+			for size := limit; size > keep; size-- {
+				if bytes.Equal(f.pending[len(f.pending)-size:], marker[:size]) {
+					keep = size
+					break
+				}
 			}
 		}
 		result = append(result, f.pending[:len(f.pending)-keep]...)
 		f.pending = f.pending[len(f.pending)-keep:]
 		return result
 	}
+}
+
+func nextInternalSSEMarker(value []byte) (int, int) {
+	index := -1
+	length := 0
+	for _, marker := range internalSSEMarkers {
+		candidate := bytes.Index(value, marker)
+		if candidate >= 0 && (index < 0 || candidate < index) {
+			index = candidate
+			length = len(marker)
+		}
+	}
+	return index, length
 }
 
 func copyJSON(writer gin.ResponseWriter, source io.Reader, protocol streamProtocol) (responseMetadata, error) {
@@ -1534,12 +1680,15 @@ func copyJSON(writer gin.ResponseWriter, source io.Reader, protocol streamProtoc
 		}
 		if readErr != nil {
 			if errors.Is(readErr, io.EOF) {
+				if transferred == 0 {
+					return responseMetadata{}, neterror.ErrUpstreamResponseEmpty
+				}
 				if metadataComplete {
 					return normalizeMetadataUsage(extractMetadata(metadataBody), protocol), nil
 				}
 				return responseMetadata{}, nil
 			}
-			return responseMetadata{}, readErr
+			return responseMetadata{Usage: gateway.Usage{OutputObserved: transferred > 0}}, readErr
 		}
 	}
 }
@@ -1555,7 +1704,15 @@ type responseInspector struct {
 	terminalFailure bool
 }
 
-const reasoningStartSSEComment = ": grok2api-reasoning-start"
+const (
+	reasoningStartSSEComment    = ": grok2api-reasoning-start"
+	reasoningEvidenceSSEComment = ": grok2api-reasoning-evidence"
+)
+
+var internalSSEMarkers = [][]byte{
+	[]byte(reasoningStartSSEComment + "\n\n"),
+	[]byte(reasoningEvidenceSSEComment + "\n\n"),
+}
 
 func (i *responseInspector) Inspect(chunk []byte) {
 	i.pending = append(i.pending, chunk...)
@@ -1611,6 +1768,10 @@ func (i *responseInspector) Inspect(chunk []byte) {
 			}
 		}
 	}
+}
+
+func (i *responseInspector) Metadata() responseMetadata {
+	return normalizeMetadataUsage(i.metadata, i.protocol)
 }
 
 func (i *responseInspector) observeReasoningStart() {
@@ -1727,10 +1888,6 @@ func containsGeneratedDelta(data []byte, protocol streamProtocol) bool {
 		}
 	}
 	return false
-}
-
-func (i *responseInspector) Metadata() responseMetadata {
-	return normalizeMetadataUsage(i.metadata, i.protocol)
 }
 
 func normalizeMetadataUsage(metadata responseMetadata, protocol streamProtocol) responseMetadata {
@@ -2120,6 +2277,11 @@ func copyHeaders(destination, source http.Header) {
 	}
 }
 
+func isEventStreamContentType(value string) bool {
+	mediaType, _, err := mime.ParseMediaType(value)
+	return err == nil && strings.EqualFold(mediaType, "text/event-stream")
+}
+
 func writeOpenAIError(c *gin.Context, status int, code, message string) {
 	errorType := "invalid_request_error"
 	switch {
@@ -2276,6 +2438,8 @@ func selectionErrorResponse(c *gin.Context, failure *gateway.SelectionUnavailabl
 			message = "上游账号当前均达到并发上限"
 		case gateway.SelectionUnsupportedModel:
 			message = "当前账号池不支持该模型"
+		case gateway.SelectionPinnedUnavailable:
+			message = "绑定的上游账号当前不可用"
 		}
 	}
 	if failure.RetryAfter > 0 {

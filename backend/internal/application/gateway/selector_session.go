@@ -28,6 +28,7 @@ type selectionSession struct {
 	retryAccountID   uint64
 	stickyTried      bool
 	staleCandidates  map[uint64]bool
+	materialFailures credentialMaterialFailureTracker
 }
 
 func (s *Selector) beginSelectionSession(ctx context.Context, provider account.Provider, modelRouteID uint64, upstreamModel, quotaMode, affinityKey string, excluded map[uint64]bool, allowQuotaProbe bool) (*selectionSession, error) {
@@ -84,6 +85,11 @@ func (s *Selector) beginSelectionSessionForKey(ctx context.Context, provider acc
 			earliestRetry = earlierFuture(earliestRetry, candidate.ModelQuotaBlock.CooldownUntil, now)
 			continue
 		}
+		if candidateEgressLeaseCooling(candidate, value, now) {
+			coolingCandidates++
+			earliestRetry = earlierFuture(earliestRetry, candidate.EgressLeaseBlock.CooldownUntil, now)
+			continue
+		}
 		if value.CooldownUntil != nil && now.Before(*value.CooldownUntil) {
 			coolingCandidates++
 			earliestRetry = earlierFuture(earliestRetry, *value.CooldownUntil, now)
@@ -138,7 +144,7 @@ func (session *selectionSession) Acquire(ctx context.Context, excluded map[uint6
 		session.retryAccountID = 0
 		if !session.candidateExcluded(excluded, accountID) {
 			if candidate, ok := routingCandidateByID(session.values, session.normalCandidates, accountID); ok {
-				lease, err := session.selector.claimAccountSlot(ctx, candidate.Credential)
+				lease, err := session.selector.claimAccountSlotTracked(ctx, candidate.Credential, &session.materialFailures)
 				if err != nil {
 					if errors.Is(err, errRoutingCredentialStale) {
 						session.markCandidateStale(accountID)
@@ -189,7 +195,7 @@ func (session *selectionSession) acquireQuotaProbe(ctx context.Context, excluded
 		if session.candidateExcluded(excluded, candidate.Credential.ID) {
 			continue
 		}
-		lease, err := session.selector.claimAccountSlot(ctx, candidate.Credential)
+		lease, err := session.selector.claimAccountSlotTracked(ctx, candidate.Credential, &session.materialFailures)
 		if err != nil {
 			if errors.Is(err, errRoutingCredentialStale) {
 				session.markCandidateStale(candidate.Credential.ID)
@@ -234,7 +240,7 @@ func (session *selectionSession) acquireNormal(ctx context.Context, excluded map
 				if candidate.Credential.ID != stickyID {
 					continue
 				}
-				lease, err := session.selector.acquirePinnedCapacity(ctx, candidate.Credential)
+				lease, err := session.selector.acquirePinnedCapacity(ctx, candidate.Credential, &session.materialFailures)
 				if err != nil {
 					if errors.Is(err, errRoutingCredentialStale) {
 						session.markCandidateStale(stickyID)
@@ -256,7 +262,7 @@ func (session *selectionSession) acquireNormal(ctx context.Context, excluded map
 	indexes := session.unexcludedNormalIndexes(excluded)
 	activeRequest := session.selector.nextSegmentedActiveRequest(session.provider, session.upstreamModel, session.quotaMode, len(indexes))
 	if activeRequest != nil {
-		lease, err := session.selector.acquireSegmentedCandidates(ctx, session.values, indexes, session.quotaMode, session.selector.resolveTierOrder(session.provider, session.upstreamModel, session.quotaMode), *activeRequest)
+		lease, err := session.selector.acquireSegmentedCandidates(ctx, session.values, indexes, session.quotaMode, session.selector.resolveTierOrder(session.provider, session.upstreamModel, session.quotaMode), *activeRequest, &session.materialFailures)
 		if err != nil || lease == nil || session.stickyKey == "" {
 			return lease, err
 		}
@@ -280,7 +286,7 @@ func (session *selectionSession) acquireNormal(ctx context.Context, excluded map
 			if session.candidateExcluded(excluded, candidate.Credential.ID) {
 				continue
 			}
-			lease, err := session.selector.claimAccountSlot(ctx, candidate.Credential)
+			lease, err := session.selector.claimAccountSlotTracked(ctx, candidate.Credential, &session.materialFailures)
 			if err != nil {
 				if errors.Is(err, errRoutingCredentialStale) {
 					session.markCandidateStale(candidate.Credential.ID)
@@ -321,7 +327,7 @@ func (session *selectionSession) completeNormalLease(ctx context.Context, lease 
 		}
 		if boundID != candidate.Credential.ID {
 			if boundCandidate, eligible := routingCandidateByID(session.values, session.normalCandidates, boundID); eligible && !session.candidateExcluded(excluded, boundID) {
-				boundLease, acquireErr := session.selector.claimAccountSlot(ctx, boundCandidate.Credential)
+				boundLease, acquireErr := session.selector.claimAccountSlotTracked(ctx, boundCandidate.Credential, &session.materialFailures)
 				if acquireErr != nil {
 					if errors.Is(acquireErr, errRoutingCredentialStale) {
 						session.markCandidateStale(boundID)

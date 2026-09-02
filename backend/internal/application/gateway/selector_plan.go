@@ -110,17 +110,18 @@ func candidateScoreBetter(values []account.RoutingCandidate, leftScore, rightSco
 }
 
 // planCandidates 批量读取动态并发状态，并以 O(n) 建堆生成保持原比较规则的候选计划。
-func (s *Selector) planCandidates(ctx context.Context, values []account.RoutingCandidate, now time.Time, tierGroups account.WebTierGroups) (*candidatePlan, error) {
-	return s.planCandidateIndexes(ctx, values, nil, now, tierGroups)
+func (s *Selector) planCandidates(ctx context.Context, values []account.RoutingCandidate, now time.Time, tierPolicy any) (*candidatePlan, error) {
+	return s.planCandidateIndexes(ctx, values, nil, now, tierPolicy)
 }
 
 // planCandidateIndexes 在不可变候选快照上按下标规划，避免过滤阶段复制完整账号结构。
 // indexes 为 nil 时表示使用 values 的全部元素。
-func (s *Selector) planCandidateIndexes(ctx context.Context, values []account.RoutingCandidate, indexes []int, now time.Time, tierGroups account.WebTierGroups) (*candidatePlan, error) {
-	return s.planCandidateIndexesWithHints(ctx, values, indexes, now, tierGroups, nil, s.preferFreeBuildEnabled())
+func (s *Selector) planCandidateIndexes(ctx context.Context, values []account.RoutingCandidate, indexes []int, now time.Time, tierPolicy any) (*candidatePlan, error) {
+	return s.planCandidateIndexesWithHints(ctx, values, indexes, now, tierPolicy, nil, s.preferFreeBuildEnabled())
 }
 
-func (s *Selector) planCandidateIndexesWithHints(ctx context.Context, values []account.RoutingCandidate, indexes []int, now time.Time, tierGroups account.WebTierGroups, concurrencyHints map[int]int, preferFreeBuild bool) (*candidatePlan, error) {
+func (s *Selector) planCandidateIndexesWithHints(ctx context.Context, values []account.RoutingCandidate, indexes []int, now time.Time, tierPolicy any, concurrencyHints map[int]int, preferFreeBuild bool) (*candidatePlan, error) {
+	tierGroups := normalizeTierGroups(tierPolicy)
 	length := len(indexes)
 	if indexes == nil {
 		length = len(values)
@@ -215,6 +216,21 @@ func (s *Selector) planCandidateIndexesWithHints(ctx context.Context, values []a
 	plan := &candidatePlan{values: values, scores: scores}
 	heap.Init(plan)
 	return plan, nil
+}
+
+func normalizeTierGroups(policy any) account.WebTierGroups {
+	switch value := policy.(type) {
+	case account.WebTierGroups:
+		return value
+	case []account.WebTier:
+		groups := make(account.WebTierGroups, 0, len(value))
+		for _, tier := range value {
+			groups = append(groups, []account.WebTier{tier})
+		}
+		return groups
+	default:
+		return nil
+	}
 }
 
 // loadConcurrencySnapshot 在极短窗口内合并相同候选池的并发快照读取。

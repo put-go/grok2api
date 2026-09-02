@@ -26,6 +26,7 @@ type Config struct {
 	VideoTimeoutSeconds      int
 	MaxInputImageBytes       int64
 	AllowNSFW                bool
+	FreeVideoDurationCap     int
 }
 
 type Adapter struct {
@@ -86,6 +87,7 @@ func normalizedConfig(cfg Config) Config {
 	if cfg.MaxInputImageBytes <= 0 {
 		cfg.MaxInputImageBytes = 32 << 20
 	}
+	cfg.FreeVideoDurationCap = normalizeFreeVideoDurationCap(cfg.FreeVideoDurationCap)
 	return cfg
 }
 
@@ -135,6 +137,15 @@ func (a *Adapter) TierGroups(upstreamModel string) account.WebTierGroups {
 	default:
 		return account.WebTierGroups{{account.WebTierBasic}, {account.WebTierSuper, account.WebTierHeavy}}
 	}
+}
+
+func (a *Adapter) TierOrder(upstreamModel string) []account.WebTier {
+	groups := a.TierGroups(upstreamModel)
+	order := make([]account.WebTier, 0, len(groups)*2)
+	for _, group := range groups {
+		order = append(order, group...)
+	}
+	return order
 }
 
 func (a *Adapter) TierOrderForQuotaMode(upstreamModel, quotaMode string) []account.WebTier {

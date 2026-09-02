@@ -9,7 +9,7 @@ export type SettingsConfigDTO = {
     baseURL: string; quotaTimeout: string; chatTimeout: string; streamIdleTimeout: string; imageTimeout: string; videoTimeout: string;
     statsigMode: "manual" | "url"; statsigManualValue?: string; statsigManualConfigured: boolean; statsigSignerURL: string;
     clearanceMode: ClearanceMode; flareSolverrURL: string; clearanceTimeout: string; clearanceRefresh: string;
-    mediaConcurrency: number; allowNSFW: boolean;
+    mediaConcurrency: number; allowNSFW: boolean; freeVideoDurationCap?: number;
     recoveryBackoffBase: string; recoveryBackoffMax: string;
   };
   providerConsole: { baseURL: string; chatTimeout: string; streamIdleTimeout: string };
@@ -24,7 +24,7 @@ export type SettingsConfigDTO = {
     accountIsolatedConnections: boolean;
     segmentedSelector: { enabled: boolean; minCandidates: number; windowSize: number };
   };
-  audit: { bufferSize: number; batchSize: number; flushInterval: string; commitDelayMS: number };
+  audit: { bufferSize: number; batchSize: number; flushInterval: string; commitDelayMS: number; retentionDays?: number };
   clientKeyDefaults: { rpmLimit: number; maxConcurrent: number };
   accounts: {
     markBuildForbiddenReauth: boolean;
@@ -121,7 +121,7 @@ const settingsConfigValidator = hasShape({
     baseURL: isString, quotaTimeout: isString, chatTimeout: isString, streamIdleTimeout: isOptional(isString), imageTimeout: isString, videoTimeout: isString,
     statsigMode: isOneOf("manual", "url"), statsigManualValue: isOptional(isString), statsigManualConfigured: isBoolean,
     statsigSignerURL: isString, clearanceMode: isOneOf("manual", "flaresolverr", "on_demand"), flareSolverrURL: isString,
-    clearanceTimeout: isString, clearanceRefresh: isString, mediaConcurrency: isNumber, allowNSFW: isBoolean, recoveryBackoffBase: isString, recoveryBackoffMax: isString,
+    clearanceTimeout: isString, clearanceRefresh: isString, mediaConcurrency: isNumber, allowNSFW: isBoolean, freeVideoDurationCap: isOptional(isNumber), recoveryBackoffBase: isString, recoveryBackoffMax: isString,
   }),
   providerConsole: hasShape({ baseURL: isString, chatTimeout: isString, streamIdleTimeout: isOptional(isString) }),
   batch: hasShape({ importConcurrency: isNumber, conversionConcurrency: isNumber, syncConcurrency: isNumber, refreshConcurrency: isNumber, randomDelay: isString }),
@@ -132,7 +132,10 @@ const settingsConfigValidator = hasShape({
     accountIsolatedConnections: isOptional(isBoolean),
     segmentedSelector: isOptional(hasShape({ enabled: isBoolean, minCandidates: isNumber, windowSize: isNumber })),
   }),
-  audit: hasShape({ bufferSize: isNumber, batchSize: isNumber, flushInterval: isString, commitDelayMS: isOptional(isNumber) }),
+  audit: hasShape({
+    bufferSize: isNumber, batchSize: isNumber, flushInterval: isString, commitDelayMS: isOptional(isNumber),
+    retentionDays: isOptional(isNumber),
+  }),
   clientKeyDefaults: hasShape({ rpmLimit: isNumber, maxConcurrent: isNumber }),
   // Older backends may omit accounts; withSettingsDefaults supplies a safe local default.
   accounts: isOptional(hasShape({
@@ -172,6 +175,7 @@ function withSettingsDefaults(snapshot: SettingsSnapshotDTO): SettingsSnapshotDT
       audit: {
         ...snapshot.config.audit,
         commitDelayMS: snapshot.config.audit.commitDelayMS ?? 5,
+        retentionDays: snapshot.config.audit.retentionDays ?? 7,
       },
       routing: {
         ...snapshot.config.routing,

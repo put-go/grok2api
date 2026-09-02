@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net"
 	"sort"
 	"strconv"
 	"strings"
@@ -27,6 +28,7 @@ const (
 	auditInsertBatchSize   = 20
 	auditLookupBatchSize   = 500
 	attemptInsertBatchSize = 40
+	auditPurgeBatchSize    = 1000
 	auditSuccessPredicate  = "status_code >= 200 AND status_code < 300 AND (error_code IS NULL OR error_code = '')"
 	auditSuccessAggregate  = "COALESCE(SUM(CASE WHEN " + auditSuccessPredicate + " THEN 1 ELSE 0 END), 0)"
 )
@@ -96,6 +98,9 @@ func validatePreparedAudit(value preparedAudit) error {
 	if row.ClientKeyID == 0 {
 		return errors.New("client_key_id must be positive")
 	}
+	if row.ClientIP != "" && net.ParseIP(row.ClientIP) == nil {
+		return errors.New("client_ip must be a valid IP address when present")
+	}
 	if row.ModelRouteID == 0 {
 		return errors.New("model_route_id must be positive")
 	}
@@ -122,6 +127,15 @@ func validatePreparedAudit(value preparedAudit) error {
 	}
 	if row.StatusCode < 100 || row.StatusCode > 599 {
 		return errors.New("status_code must be between 100 and 599")
+	}
+	if utf8.RuneCountInString(row.RequestMethod) > 16 {
+		return errors.New("request method exceeds the storage limit")
+	}
+	if utf8.RuneCountInString(row.RequestPath) > 2048 {
+		return errors.New("request path exceeds the storage limit")
+	}
+	if utf8.RuneCountInString(row.RequestHeadersJSON) > 65536 {
+		return errors.New("request headers exceed the storage limit")
 	}
 	attemptNumbers := make(map[int]struct{}, len(value.attempts))
 	for index, attempt := range value.attempts {
@@ -347,8 +361,14 @@ func toAuditModels(value audit.Record) (requestAuditModel, []requestAuditAttempt
 		digest := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%d\x00%d\x00%d", value.RequestID, value.ClientKeyID, value.ModelRouteID, value.CreatedAt.UnixNano())))
 		eventID = fmt.Sprintf("evt_%x", digest[:18])
 	}
+	requestHeadersJSON := "{}"
+	if len(value.RequestHeaders) > 0 {
+		if raw, err := json.Marshal(value.RequestHeaders); err == nil {
+			requestHeadersJSON = string(raw)
+		}
+	}
 	row := requestAuditModel{
-		EventID: truncate(eventID, 64), RequestID: truncate(value.RequestID, 64), ClientKeyID: value.ClientKeyID, ClientKeyName: truncate(value.ClientKeyName, 160),
+		EventID: truncate(eventID, 64), RequestID: truncate(value.RequestID, 64), ClientKeyID: value.ClientKeyID, ClientKeyName: truncate(value.ClientKeyName, 160), ClientIP: strings.TrimSpace(value.ClientIP),
 		ModelRouteID: value.ModelRouteID, ModelPublicID: truncate(value.ModelPublicID, 255), ModelUpstreamModel: truncate(value.ModelUpstreamModel, 255),
 		Provider: truncate(provider, 32), Operation: string(operation), UsageSource: string(usageSource),
 		ReasoningEffort: audit.NormalizeReasoningEffort(value.ReasoningEffort),
@@ -361,7 +381,11 @@ func toAuditModels(value audit.Record) (requestAuditModel, []requestAuditAttempt
 		EstimatedCostInUSDTicks: nonNegative(value.EstimatedCostInUSDTicks), PricingModel: truncate(value.PricingModel, 100), PricingVersion: truncate(value.PricingVersion, 20),
 		NumSourcesUsed: nonNegative(value.NumSourcesUsed), NumServerSideToolsUsed: nonNegative(value.NumServerSideToolsUsed),
 		ContextInputTokens: nonNegative(value.ContextInputTokens), ContextOutputTokens: nonNegative(value.ContextOutputTokens), FirstTokenMS: normalizedFirstToken(value), DurationMS: nonNegative(value.DurationMS),
-		ErrorCode: truncate(value.ErrorCode, 100), AttemptCount: len(value.Attempts), CreatedAt: value.CreatedAt,
+		ErrorCode:          truncate(value.ErrorCode, 100),
+		RequestMethod:      truncate(value.RequestMethod, 16),
+		RequestPath:        truncate(value.RequestPath, 2048),
+		RequestHeadersJSON: truncate(requestHeadersJSON, 65536),
+		AttemptCount:       len(value.Attempts), CreatedAt: value.CreatedAt,
 	}
 	attempts := make([]requestAuditAttemptModel, 0, len(value.Attempts))
 	for _, attempt := range value.Attempts {
@@ -572,7 +596,7 @@ func (r *AuditRepository) List(ctx context.Context, offset, limit int) ([]audit.
 		return nil, 0, err
 	}
 	var rows []requestAuditModel
-	if err := query.Order("created_at DESC, id DESC").Offset(offset).Limit(limit).Find(&rows).Error; err != nil {
+	if err := query.Omit("request_headers_json").Order("created_at DESC, id DESC").Offset(offset).Limit(limit).Find(&rows).Error; err != nil {
 		return nil, 0, err
 	}
 	out := make([]audit.Record, 0, len(rows))
@@ -628,7 +652,7 @@ func (r *AuditRepository) ListCursor(ctx context.Context, input repository.Audit
 	}
 	var rows []requestAuditModel
 	query = applyStableSort(query, input.Sort, fields, fallback, "request_audits.id")
-	if err := query.Limit(input.Limit + 1).Find(&rows).Error; err != nil {
+	if err := query.Omit("request_headers_json").Limit(input.Limit + 1).Find(&rows).Error; err != nil {
 		return nil, false, err
 	}
 	hasMore := len(rows) > input.Limit
@@ -712,6 +736,11 @@ type degradeAccountRow struct {
 	Enabled            bool             `gorm:"column:enabled"`
 	Found              bool             `gorm:"column:found"`
 	BuildBotFlagSource int              `gorm:"column:build_bot_flag_source"`
+}
+
+type degradeAccountLeaseRow struct {
+	AccountID     uint64           `gorm:"column:account_id"`
+	CooldownUntil degradeTimestamp `gorm:"column:cooldown_until"`
 }
 
 type degradeTimestamp time.Time
@@ -850,6 +879,20 @@ func (r *AuditRepository) SummarizeDegrade(ctx context.Context, input repository
 			accountsByID[row.ID] = &result.Accounts[len(result.Accounts)-1]
 		}
 		if len(accountIDs) > 0 {
+			var leaseRows []degradeAccountLeaseRow
+			if err := tx.Table("account_egress_lease_blocks").
+				Select("account_id, MAX(cooldown_until) AS cooldown_until").
+				Where("account_id IN ? AND cooldown_until > ?", accountIDs, input.End).
+				Group("account_id").Scan(&leaseRows).Error; err != nil {
+				return err
+			}
+			for _, row := range leaseRows {
+				if account := accountsByID[row.AccountID]; account != nil {
+					cooldownUntil := time.Time(row.CooldownUntil).UTC()
+					account.LeaseCooldownUntil = &cooldownUntil
+				}
+			}
+
 			var nodeRows []degradeAccountNodeRow
 			if err := tx.Table("(?) AS d", classified).
 				Select("d.account_id, COALESCE(NULLIF(d.egress_node_name, ''), '?') AS name").
@@ -1003,7 +1046,7 @@ func degradeBucketCase(buckets []repository.DegradeBucketRange) (string, []any) 
 func applyAuditQuery(query *gorm.DB, search string, start, end time.Time, filter repository.AuditListFilter) *gorm.DB {
 	if value := strings.TrimSpace(search); value != "" {
 		pattern := "%" + strings.ToLower(value) + "%"
-		query = query.Where("LOWER(request_id) LIKE ? OR LOWER(model_public_id) LIKE ? OR LOWER(model_upstream_model) LIKE ? OR LOWER(egress_node_name) LIKE ?", pattern, pattern, pattern, pattern)
+		query = query.Where("LOWER(request_id) LIKE ? OR LOWER(model_public_id) LIKE ? OR LOWER(model_upstream_model) LIKE ? OR LOWER(client_ip) LIKE ? OR LOWER(egress_node_name) LIKE ?", pattern, pattern, pattern, pattern, pattern)
 	}
 	if !start.IsZero() {
 		query = query.Where("created_at >= ?", start)
@@ -1042,4 +1085,49 @@ func applyAuditQuery(query *gorm.DB, search string, start, end time.Time, filter
 		query = query.Where("streaming = ?", false)
 	}
 	return query
+}
+
+func (r *AuditRepository) PurgeOlderThan(ctx context.Context, cutoff time.Time) (int64, error) {
+	var totalDeleted int64
+	for {
+		var batchDeleted int64
+		var batchSelected int
+		err := r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			var ids []uint64
+			if err := tx.Model(&requestAuditModel{}).
+				Select("id").
+				Where("created_at < ?", cutoff).
+				Order("id ASC").
+				Limit(auditPurgeBatchSize).
+				Pluck("id", &ids).Error; err != nil {
+				return err
+			}
+			if len(ids) == 0 {
+				return nil
+			}
+			batchSelected = len(ids)
+			if err := tx.Where("audit_id IN ?", ids).Delete(&requestAuditAttemptModel{}).Error; err != nil {
+				return err
+			}
+			res := tx.Where("id IN ? AND created_at < ?", ids, cutoff).Delete(&requestAuditModel{})
+			if res.Error != nil {
+				return res.Error
+			}
+			batchDeleted = res.RowsAffected
+			return nil
+		})
+		if err != nil {
+			return totalDeleted, err
+		}
+		totalDeleted += batchDeleted
+		// Use the number selected rather than RowsAffected to decide whether
+		// another batch may exist. In a multi-instance deployment another
+		// cleaner can delete part of this batch between selection and deletion.
+		if batchSelected < auditPurgeBatchSize {
+			return totalDeleted, nil
+		}
+		if err := ctx.Err(); err != nil {
+			return totalDeleted, err
+		}
+	}
 }

@@ -89,6 +89,7 @@ export const settingsSchema = z.object({
     clearanceRefresh: durationSchema.refine((value) => durationSeconds(value) >= 60 && durationSeconds(value) <= 86_400),
     quotaTimeout: durationSchema, chatTimeout: durationSchema, streamIdleTimeout: providerStreamIdleDuration, imageTimeout: durationSchema, videoTimeout: durationSchema,
     mediaConcurrency: positiveInteger.max(64), allowNSFW: z.boolean(),
+    freeVideoDurationCap: z.number().int().min(1).max(15),
     recoveryBackoffBase: durationSchema, recoveryBackoffMax: durationSchema,
   }).superRefine((value, context) => {
     if (durationSeconds(value.streamIdleTimeout) > durationSeconds(value.chatTimeout)) {
@@ -152,7 +153,13 @@ export const settingsSchema = z.object({
     }),
   }).refine((value) => durationSeconds(value.cooldownMax) >= durationSeconds(value.cooldownBase), { path: ["cooldownMax"] })
     .refine((value) => value.segmentedSelector.windowSize <= value.segmentedSelector.minCandidates, { path: ["segmentedSelector", "windowSize"] }),
-  audit: z.object({ bufferSize: positiveInteger.max(262_144), batchSize: positiveInteger.max(4_096), flushInterval: auditFlushDuration, commitDelayMS: positiveInteger.max(50) })
+  audit: z.object({
+    bufferSize: positiveInteger.max(262_144),
+    batchSize: positiveInteger.max(4_096),
+    flushInterval: auditFlushDuration,
+    commitDelayMS: positiveInteger.max(50),
+    retentionDays: z.number().int().min(0).max(365),
+  })
     .refine((value) => value.batchSize <= value.bufferSize, { path: ["batchSize"] }),
   clientKeyDefaults: z.object({ rpmLimit: positiveInteger.max(100_000), maxConcurrent: positiveInteger.max(1_024) }),
   accounts: z.object({
@@ -189,6 +196,7 @@ export function toSettingsForm(config: SettingsConfigDTO): SettingsForm {
       clearanceTimeout: parseDuration(config.providerWeb.clearanceTimeout), clearanceRefresh: parseDuration(config.providerWeb.clearanceRefresh),
       quotaTimeout: parseDuration(config.providerWeb.quotaTimeout), chatTimeout: parseDuration(config.providerWeb.chatTimeout), streamIdleTimeout: parseDuration(config.providerWeb.streamIdleTimeout),
       imageTimeout: parseDuration(config.providerWeb.imageTimeout), videoTimeout: parseDuration(config.providerWeb.videoTimeout),
+      freeVideoDurationCap: config.providerWeb.freeVideoDurationCap || 6,
       recoveryBackoffBase: parseDuration(config.providerWeb.recoveryBackoffBase), recoveryBackoffMax: parseDuration(config.providerWeb.recoveryBackoffMax),
     },
     providerConsole: { ...config.providerConsole, chatTimeout: parseDuration(config.providerConsole.chatTimeout), streamIdleTimeout: parseDuration(config.providerConsole.streamIdleTimeout) },
@@ -209,7 +217,13 @@ export function toSettingsForm(config: SettingsConfigDTO): SettingsForm {
       accountIsolatedConnections: config.routing.accountIsolatedConnections,
       segmentedSelector: config.routing.segmentedSelector,
     },
-    audit: { bufferSize: config.audit.bufferSize, batchSize: config.audit.batchSize, flushInterval: parseDuration(config.audit.flushInterval), commitDelayMS: config.audit.commitDelayMS },
+    audit: {
+      bufferSize: config.audit.bufferSize,
+      batchSize: config.audit.batchSize,
+      flushInterval: parseDuration(config.audit.flushInterval),
+      commitDelayMS: config.audit.commitDelayMS,
+      retentionDays: config.audit.retentionDays ?? 7,
+    },
     clientKeyDefaults: config.clientKeyDefaults,
     accounts: {
       markBuildForbiddenReauth: config.accounts.markBuildForbiddenReauth,
@@ -252,7 +266,13 @@ export function toSettingsDTO(config: SettingsForm): SettingsConfigDTO {
       accountIsolatedConnections: config.routing.accountIsolatedConnections,
       segmentedSelector: config.routing.segmentedSelector,
     },
-    audit: { bufferSize: config.audit.bufferSize, batchSize: config.audit.batchSize, flushInterval: formatDuration(config.audit.flushInterval), commitDelayMS: config.audit.commitDelayMS },
+    audit: {
+      bufferSize: config.audit.bufferSize,
+      batchSize: config.audit.batchSize,
+      flushInterval: formatDuration(config.audit.flushInterval),
+      commitDelayMS: config.audit.commitDelayMS,
+      retentionDays: config.audit.retentionDays,
+    },
     clientKeyDefaults: config.clientKeyDefaults,
     accounts: {
       markBuildForbiddenReauth: config.accounts.markBuildForbiddenReauth,
