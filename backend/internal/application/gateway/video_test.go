@@ -270,11 +270,11 @@ func TestCreateVideoAppliesRouteConstraintsAfterKeyEligibilityAndBeforeInputIO(t
 }
 
 func TestVideo1080pValidationUsesResolvedUpstreamModel(t *testing.T) {
+	if err := validateVideoRouteParameters(account.ProviderConsole, provider.VideoOperationGenerate, "grok-imagine-video", "1080p", true, 0, 6); err != nil {
+		t.Fatalf("base image-to-video 1080p rejected: %v", err)
+	}
 	if err := validateVideoRouteParameters(account.ProviderConsole, provider.VideoOperationGenerate, "grok-imagine-video-1.5", "1080P", false, 0, 6); err != nil {
 		t.Fatalf("1.5 text/image 1080p rejected: %v", err)
-	}
-	if err := validateVideoRouteParameters(account.ProviderConsole, provider.VideoOperationGenerate, "grok-imagine-video", "1080p", false, 0, 6); !errors.Is(err, ErrVideoOperationUnsupported) {
-		t.Fatalf("legacy 1080p error = %v", err)
 	}
 	if err := validateVideoRouteParameters(account.ProviderConsole, provider.VideoOperationGenerate, "grok-imagine-video-1.5", "1080p", false, 1, 6); !errors.Is(err, ErrVideoOperationUnsupported) {
 		t.Fatalf("reference 1080p error = %v", err)

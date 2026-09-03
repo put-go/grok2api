@@ -255,11 +255,11 @@ func validateVideoRouteParameters(providerValue account.Provider, operation prov
 	if !strings.EqualFold(strings.TrimSpace(resolution), "1080p") {
 		return nil
 	}
-	if trimmedModel != "grok-imagine-video-1.5" {
-		return fmt.Errorf("%w: %s 不支持 1080p", ErrVideoOperationUnsupported, upstreamModel)
-	}
 	if hasReferences {
 		return fmt.Errorf("%w: reference_images 模式最高支持 720p", ErrVideoOperationUnsupported)
+	}
+	if trimmedModel != "grok-imagine-video" && trimmedModel != "grok-imagine-video-1.5" {
+		return fmt.Errorf("%w: %s 不支持 1080p", ErrVideoOperationUnsupported, upstreamModel)
 	}
 	return nil
 }

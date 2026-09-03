@@ -494,7 +494,7 @@ func (a *Adapter) GenerateVideo(ctx context.Context, request provider.VideoReque
 		return provider.VideoResult{}, errors.New("视频编辑不支持 duration")
 	}
 	if request.Resolution == "1080p" {
-		if modelName != "grok-imagine-video-1.5" {
+		if modelName != "grok-imagine-video" && modelName != "grok-imagine-video-1.5" {
 			return provider.VideoResult{}, fmt.Errorf("%s 不支持 1080p", modelName)
 		}
 		if len(request.ReferenceURLs) > 0 {
