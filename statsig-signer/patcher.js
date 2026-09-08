@@ -60,6 +60,19 @@ export function patchStatsigChunk(source) {
 
   const structuralMatch = findStructuralSignerWrapper(source);
   if (!structuralMatch) {
+    const usageMatch = findStatsigSignerUsage(source);
+    if (usageMatch) {
+      const call = source.slice(usageMatch.start, usageMatch.end);
+      return {
+        patched: true,
+        source:
+          source.slice(0, usageMatch.start) +
+          `(globalThis.__grok2apiStatsigSign=${usageMatch.functionName},${call})` +
+          source.slice(usageMatch.end),
+        functionName: usageMatch.functionName,
+        loaderModuleID: "direct",
+      };
+    }
     return { patched: false, source };
   }
 
@@ -85,6 +98,46 @@ export function patchStatsigChunk(source) {
       source.slice(structuralMatch.start),
     functionName: structuralMatch.functionName,
     loaderModuleID: structuralMatch.loaderModuleID,
+  };
+}
+
+function findStatsigSignerUsage(source) {
+  const syntaxTree = parseChunk(source);
+  if (!syntaxTree) {
+    return undefined;
+  }
+  const markerContexts = new Set();
+  const calls = [];
+  walkSyntax(syntaxTree, [], (node, ancestors) => {
+    if (literalValue(node) === "x-statsig-id") {
+      const context = ancestors.findLast((ancestor) =>
+        ancestor.type === "AssignmentExpression" || ancestor.type === "Property"
+      );
+      if (context) {
+        markerContexts.add(context);
+      }
+    }
+    const value = node.type === "ChainExpression" ? node.expression : node;
+    if (
+      value?.type === "CallExpression" &&
+      value.callee?.type === "Identifier" &&
+      value.arguments?.length === 2
+    ) {
+      const context = ancestors.findLast((ancestor) =>
+        ancestor.type === "AssignmentExpression" || ancestor.type === "Property"
+      );
+      calls.push({ node: value, functionName: value.callee.name, context });
+    }
+  });
+
+  const candidates = calls.filter((call) => markerContexts.has(call.context));
+  if (candidates.length !== 1) {
+    return undefined;
+  }
+  return {
+    start: candidates[0].node.start,
+    end: candidates[0].node.end,
+    functionName: candidates[0].functionName,
   };
 }
 
