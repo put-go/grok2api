@@ -22,7 +22,7 @@ const cachedFactorySignerPattern = new RegExp(
 export function patchStatsigChunk(source) {
   if (
     typeof source !== "string" ||
-    !source.includes("x-statsig-id") ||
+    !source.toLowerCase().includes("x-statsig-id") ||
     source.includes("__grok2apiStatsigSign")
   ) {
     return { patched: false, source };
@@ -66,7 +66,7 @@ export function patchStatsigChunk(source) {
       const callee = source.slice(usageMatch.calleeStart, usageMatch.calleeEnd);
       const exposed =
         usageMatch.calleeType !== "Identifier"
-          ? `(...__grok2apiStatsigArgs)=>${callee}(...__grok2apiStatsigArgs)`
+          ? `(...__grok2apiStatsigArgs)=>(${callee})(...__grok2apiStatsigArgs)`
           : callee;
       return {
         patched: true,
@@ -112,32 +112,40 @@ function findStatsigSignerUsage(source) {
     return undefined;
   }
   const markerContexts = new Set();
+  const markerFunctions = new Set();
   const calls = [];
   walkSyntax(syntaxTree, [], (node, ancestors) => {
-    if (literalValue(node) === "x-statsig-id") {
+    if (String(literalValue(node) ?? "").toLowerCase() === "x-statsig-id") {
       const context = ancestors.findLast(isStatementNode);
       if (context) {
         markerContexts.add(context);
       }
+      const owner = ancestors.findLast(isFunctionNode);
+      if (owner) {
+        markerFunctions.add(owner);
+      }
     }
-    const value = node.type === "ChainExpression" ? node.expression : node;
     if (
-      value?.type === "CallExpression" &&
-      value.arguments?.length === 2 &&
+      node.type === "CallExpression" &&
+      node.arguments?.length === 2 &&
       ancestors.some((ancestor) => ancestor.type === "AwaitExpression") &&
-      isCallableExpression(value.callee)
+      isCallableExpression(node.callee)
     ) {
       const context = ancestors.findLast(isStatementNode);
       calls.push({
-        node: value,
-        functionName: inferCallName(value.callee),
-        callee: value.callee,
+        node,
+        functionName: inferCallName(node.callee),
+        callee: node.callee,
         context,
+        owner: ancestors.findLast(isFunctionNode),
       });
     }
   });
 
-  const candidates = calls.filter((call) => markerContexts.has(call.context));
+  let candidates = calls.filter((call) => markerContexts.has(call.context));
+  if (candidates.length === 0) {
+    candidates = calls.filter((call) => call.owner && markerFunctions.has(call.owner));
+  }
   if (candidates.length !== 1) {
     return undefined;
   }
@@ -182,6 +190,42 @@ function isStatementNode(node) {
     node.type === "VariableDeclaration" ||
     node.type === "ReturnStatement" ||
     node.type === "ThrowStatement";
+}
+
+function isFunctionNode(node) {
+  return node.type === "FunctionDeclaration" ||
+    node.type === "FunctionExpression" ||
+    node.type === "ArrowFunctionExpression";
+}
+
+export function inspectStatsigChunk(source) {
+  if (typeof source !== "string") {
+    return { bytes: 0, parseable: false, exactHeader: false, statsigMentions: 0, snippets: [] };
+  }
+  const lowerSource = source.toLowerCase();
+  const indexes = [];
+  let mentions = 0;
+  let offset = 0;
+  while (true) {
+    const index = lowerSource.indexOf("statsig", offset);
+    if (index < 0) {
+      break;
+    }
+    mentions += 1;
+    if (indexes.length < 3) {
+      indexes.push(index);
+    }
+    offset = index + 7;
+  }
+  return {
+    bytes: Buffer.byteLength(source),
+    parseable: Boolean(parseChunk(source)),
+    exactHeader: lowerSource.includes("x-statsig-id"),
+    statsigMentions: mentions,
+    snippets: indexes.map((index) =>
+      source.slice(Math.max(0, index - 160), index + 320).replace(/\s+/g, " ").slice(0, 480)
+    ),
+  };
 }
 
 function findStructuralSignerWrapper(source) {

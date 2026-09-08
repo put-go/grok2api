@@ -1,6 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { isValidStatsigID, patchStatsigChunk, prepareStatsigDocument } from "./patcher.js";
+import {
+  inspectStatsigChunk,
+  isValidStatsigID,
+  patchStatsigChunk,
+  prepareStatsigDocument,
+} from "./patcher.js";
 
 test("patchStatsigChunk exposes the current Turbopack wrapper", () => {
   const source =
@@ -111,8 +116,52 @@ test("patchStatsigChunk captures a namespaced signer call", () => {
 
   assert.equal(result.patched, true);
   assert.equal(result.functionName, "sign");
-  assert.match(result.source, /__grok2apiStatsigSign=\(\.\.\.__grok2apiStatsigArgs\)=>signerModule\.sign/);
+  assert.match(result.source, /__grok2apiStatsigSign=\(\.\.\.__grok2apiStatsigArgs\)=>\(signerModule\.sign\)/);
   assert.doesNotThrow(() => new Function(result.source));
+});
+
+test("patchStatsigChunk preserves an indirect sequence callee", async () => {
+  const source =
+    'return async function apply(request){request.headers.set("x-statsig-id",await (0,signerModule.sign)(request.path,request.method))}';
+  const result = patchStatsigChunk(source);
+  const headers = new Map();
+  const apply = new Function("signerModule", result.source)({
+    sign: async (path, method) => `${method}:${path}`,
+  });
+
+  await apply({ headers, path: "/rest/test", method: "POST" });
+  assert.equal(headers.get("x-statsig-id"), "POST:/rest/test");
+  assert.equal(await globalThis.__grok2apiStatsigSign("/rest/next", "GET"), "GET:/rest/next");
+  delete globalThis.__grok2apiStatsigSign;
+});
+
+test("patchStatsigChunk captures optional signer calls once", () => {
+  for (const call of ["signer?.(request.path,request.method)", "module?.sign(request.path,request.method)"]) {
+    const source =
+      `async function apply(request){request.headers.set("x-statsig-id",await ${call})}`;
+    const result = patchStatsigChunk(source);
+    assert.equal(result.patched, true);
+    assert.doesNotThrow(() => new Function(result.source));
+  }
+});
+
+test("patchStatsigChunk follows a signature through a local variable", () => {
+  const source =
+    'async function apply(request){const id=await signer(request.path,request.method);request.headers.set("x-statsig-id",id)}';
+  const result = patchStatsigChunk(source);
+
+  assert.equal(result.patched, true);
+  assert.equal(result.functionName, "signer");
+  assert.doesNotThrow(() => new Function(result.source));
+});
+
+test("inspectStatsigChunk returns bounded static diagnostics", () => {
+  const result = inspectStatsigChunk('void "X-Statsig-Id";'.repeat(10));
+  assert.equal(result.parseable, true);
+  assert.equal(result.exactHeader, true);
+  assert.equal(result.statsigMentions, 10);
+  assert.equal(result.snippets.length, 3);
+  assert.ok(result.snippets.every((snippet) => snippet.length <= 480));
 });
 
 test("patchStatsigChunk rejects ambiguous structural wrappers", () => {

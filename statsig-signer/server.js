@@ -1,7 +1,12 @@
 import http from "node:http";
 import { readFile } from "node:fs/promises";
 import { chromium } from "playwright";
-import { isValidStatsigID, patchStatsigChunk, prepareStatsigDocument } from "./patcher.js";
+import {
+  inspectStatsigChunk,
+  isValidStatsigID,
+  patchStatsigChunk,
+  prepareStatsigDocument,
+} from "./patcher.js";
 import { inferAccountTier, isLoginURL } from "./session.js";
 
 const port = parseInteger(process.env.PORT, 3000);
@@ -105,7 +110,16 @@ async function createSession(metaContent) {
     serviceWorkers: "block",
     viewport: { width: 1280, height: 900 },
   });
-  const patchState = { inspected: 0, patched: false, loaderModuleID: "", chunkPath: "" };
+  const patchState = {
+    inspected: 0,
+    statsigScripts: 0,
+    exactHeaderScripts: 0,
+    parseFailures: 0,
+    loggedCandidates: 0,
+    patched: false,
+    loaderModuleID: "",
+    chunkPath: "",
+  };
   let documentMeta = "";
   let documentPatchError;
   let resolveSignedResponse;
@@ -171,23 +185,42 @@ async function createSession(metaContent) {
         }
       },
     );
-    await nextContext.route(/\/_next\/static\/chunks\/.*\.js(?:\?.*)?$/, async (route) => {
+    await nextContext.route("**/*", async (route) => {
       if (patchState.patched) {
-        await route.continue();
+        await route.fallback();
         return;
       }
       try {
+        const requestURL = new URL(route.request().url());
+        const grokHost = requestURL.hostname === "grok.com" || requestURL.hostname.endsWith(".grok.com");
+        if (!grokHost || route.request().resourceType() !== "script") {
+          await route.fallback();
+          return;
+        }
         const response = await route.fetch();
         const source = await response.text();
         patchState.inspected += 1;
         const result = patchStatsigChunk(source);
         if (!result.patched) {
+          const diagnostics = inspectStatsigChunk(source);
+          if (diagnostics.statsigMentions > 0) {
+            patchState.statsigScripts += 1;
+            patchState.exactHeaderScripts += Number(diagnostics.exactHeader);
+            patchState.parseFailures += Number(!diagnostics.parseable);
+            if (patchState.loggedCandidates < 5) {
+              patchState.loggedCandidates += 1;
+              log("warn", "statsig_chunk_unmatched", {
+                chunkPath: requestURL.pathname,
+                ...diagnostics,
+              });
+            }
+          }
           await route.fulfill({ response, body: source });
           return;
         }
         patchState.patched = true;
         patchState.loaderModuleID = result.loaderModuleID;
-        patchState.chunkPath = new URL(route.request().url()).pathname;
+        patchState.chunkPath = requestURL.pathname;
         await route.fulfill({ response, body: result.source });
       } catch (error) {
         log("warn", "chunk_route_failed", { error: String(error?.message ?? error) });
@@ -219,7 +252,13 @@ async function createSession(metaContent) {
       });
     } catch (error) {
       if (!patchState.patched) {
-        throw new Error(`Grok signer wrapper structure changed after inspecting ${patchState.inspected} chunks`);
+        log("warn", "signer_patch_diagnostics", {
+          inspectedScripts: patchState.inspected,
+          statsigScripts: patchState.statsigScripts,
+          exactHeaderScripts: patchState.exactHeaderScripts,
+          parseFailures: patchState.parseFailures,
+        });
+        throw new Error(`Grok signer wrapper structure changed after inspecting ${patchState.inspected} scripts`);
       }
       throw error;
     }
