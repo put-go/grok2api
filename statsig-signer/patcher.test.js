@@ -92,6 +92,16 @@ test("patchStatsigChunk rejects async two-argument decoys", () => {
   assert.deepEqual(patchStatsigChunk(source), { patched: false, source });
 });
 
+test("patchStatsigChunk tolerates helper-separated loader access", () => {
+  const filler = "x".repeat(900);
+  const source =
+    `const marker="x-statsig-id";async function sign(path,method){const module=await runtime.A(77);const ${filler}=0;const signer=module.default;return await signer?.(path,method)}`;
+  const result = patchStatsigChunk(source);
+  assert.equal(result.patched, true);
+  assert.equal(result.functionName, "sign");
+  assert.equal(result.loaderModuleID, "77");
+});
+
 test("patchStatsigChunk leaves unrelated chunks unchanged", () => {
   const source = 'const header="x-statsig-id";';
   assert.deepEqual(patchStatsigChunk(source), { patched: false, source });

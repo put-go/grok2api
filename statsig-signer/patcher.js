@@ -218,9 +218,12 @@ function returnsSignerCall(body, firstParameter, secondParameter) {
       return;
     }
     const value = unwrapAwait(node.argument);
+    const callee = value?.type === "CallExpression"
+      ? (value.callee?.type === "ChainExpression" ? value.callee.expression : value.callee)
+      : undefined;
     if (
       value?.type === "CallExpression" &&
-      value.callee?.type === "Identifier" &&
+      (callee?.type === "Identifier" || callee?.type === "MemberExpression") &&
       value.arguments?.length === 2 &&
       value.arguments[0]?.type === "Identifier" &&
       value.arguments[0].name === firstParameter &&
@@ -300,7 +303,9 @@ function findSignerLoader(contextNode, wrapperStart) {
       (distance, access) => Math.min(distance, Math.abs(access.start - loader.index)),
       Number.POSITIVE_INFINITY,
     );
-    if (defaultDistance > 600) {
+    // Bundlers may place the export access behind a small helper chain. Keep
+    // the association local to the chunk, but do not assume minified layout.
+    if (defaultDistance > 5000) {
       continue;
     }
     const wrapperDistance = Math.abs(wrapperStart - loader.index);
