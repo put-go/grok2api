@@ -63,11 +63,16 @@ export function patchStatsigChunk(source) {
     const usageMatch = findStatsigSignerUsage(source);
     if (usageMatch) {
       const call = source.slice(usageMatch.start, usageMatch.end);
+      const callee = source.slice(usageMatch.calleeStart, usageMatch.calleeEnd);
+      const exposed =
+        usageMatch.calleeType !== "Identifier"
+          ? `(...__grok2apiStatsigArgs)=>${callee}(...__grok2apiStatsigArgs)`
+          : callee;
       return {
         patched: true,
         source:
           source.slice(0, usageMatch.start) +
-          `(globalThis.__grok2apiStatsigSign=${usageMatch.functionName},${call})` +
+          `(globalThis.__grok2apiStatsigSign=${exposed},${call})` +
           source.slice(usageMatch.end),
         functionName: usageMatch.functionName,
         loaderModuleID: "direct",
@@ -110,9 +115,7 @@ function findStatsigSignerUsage(source) {
   const calls = [];
   walkSyntax(syntaxTree, [], (node, ancestors) => {
     if (literalValue(node) === "x-statsig-id") {
-      const context = ancestors.findLast((ancestor) =>
-        ancestor.type === "AssignmentExpression" || ancestor.type === "Property"
-      );
+      const context = ancestors.findLast(isStatementNode);
       if (context) {
         markerContexts.add(context);
       }
@@ -120,13 +123,17 @@ function findStatsigSignerUsage(source) {
     const value = node.type === "ChainExpression" ? node.expression : node;
     if (
       value?.type === "CallExpression" &&
-      value.callee?.type === "Identifier" &&
-      value.arguments?.length === 2
+      value.arguments?.length === 2 &&
+      ancestors.some((ancestor) => ancestor.type === "AwaitExpression") &&
+      isCallableExpression(value.callee)
     ) {
-      const context = ancestors.findLast((ancestor) =>
-        ancestor.type === "AssignmentExpression" || ancestor.type === "Property"
-      );
-      calls.push({ node: value, functionName: value.callee.name, context });
+      const context = ancestors.findLast(isStatementNode);
+      calls.push({
+        node: value,
+        functionName: inferCallName(value.callee),
+        callee: value.callee,
+        context,
+      });
     }
   });
 
@@ -138,7 +145,43 @@ function findStatsigSignerUsage(source) {
     start: candidates[0].node.start,
     end: candidates[0].node.end,
     functionName: candidates[0].functionName,
+    calleeType: candidates[0].callee.type,
+    calleeStart: candidates[0].callee.start,
+    calleeEnd: candidates[0].callee.end,
   };
+}
+
+function isCallableExpression(node) {
+  if (!node) {
+    return false;
+  }
+  if (node.type === "ChainExpression") {
+    return isCallableExpression(node.expression);
+  }
+  if (node.type === "SequenceExpression") {
+    return isCallableExpression(node.expressions.at(-1));
+  }
+  return node.type === "Identifier" || node.type === "MemberExpression";
+}
+
+function inferCallName(node) {
+  if (node.type === "ChainExpression") {
+    return inferCallName(node.expression);
+  }
+  if (node.type === "SequenceExpression") {
+    return inferCallName(node.expressions.at(-1));
+  }
+  if (node.type === "Identifier") {
+    return node.name;
+  }
+  return memberName(node) || "anonymous";
+}
+
+function isStatementNode(node) {
+  return node.type === "ExpressionStatement" ||
+    node.type === "VariableDeclaration" ||
+    node.type === "ReturnStatement" ||
+    node.type === "ThrowStatement";
 }
 
 function findStructuralSignerWrapper(source) {

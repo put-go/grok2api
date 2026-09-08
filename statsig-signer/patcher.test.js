@@ -93,6 +93,28 @@ test("patchStatsigChunk captures a signer directly from the header usage", () =>
   assert.doesNotThrow(() => new Function(result.source));
 });
 
+test("patchStatsigChunk captures a signer used through Headers.set", () => {
+  const source =
+    'async function apply(request){request.headers.set("x-statsig-id",await importedSigner(request.path,request.method))}';
+  const result = patchStatsigChunk(source);
+
+  assert.equal(result.patched, true);
+  assert.equal(result.functionName, "importedSigner");
+  assert.equal(result.loaderModuleID, "direct");
+  assert.doesNotThrow(() => new Function(result.source));
+});
+
+test("patchStatsigChunk captures a namespaced signer call", () => {
+  const source =
+    'async function apply(request){request.headers.set("x-statsig-id",await signerModule.sign(request.path,request.method))}';
+  const result = patchStatsigChunk(source);
+
+  assert.equal(result.patched, true);
+  assert.equal(result.functionName, "sign");
+  assert.match(result.source, /__grok2apiStatsigSign=\(\.\.\.__grok2apiStatsigArgs\)=>signerModule\.sign/);
+  assert.doesNotThrow(() => new Function(result.source));
+});
+
 test("patchStatsigChunk rejects ambiguous structural wrappers", () => {
   const source =
     'const marker="x-statsig-id";async function first(path,method){let module=await runtime.A(1),signer=module.default;return signer(path,method)}async function second(path,method){let module=await runtime.A(2),signer=module.default;return signer(path,method)}';
