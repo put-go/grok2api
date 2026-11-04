@@ -181,3 +181,17 @@ func TestBillingPeriodEndMatchesExhaustedLimit(t *testing.T) {
 		t.Fatalf("monthly period end = %v, %v", value, ok)
 	}
 }
+
+func TestSupportsWebVideoDuration(t *testing.T) {
+	for _, tier := range []WebTier{WebTierBasic, WebTierAuto, WebTierSuper, WebTierHeavy, ""} {
+		for _, seconds := range []int{0, 1, 5, 6, 7, 10, 15} {
+			want := seconds > 6
+			if tier == WebTierBasic {
+				want = seconds == 6
+			}
+			if got := (Credential{WebTier: tier}).SupportsWebVideoDuration(seconds); got != want {
+				t.Errorf("tier=%q seconds=%d: got %v want %v", tier, seconds, got, want)
+			}
+		}
+	}
+}

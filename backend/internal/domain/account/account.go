@@ -658,3 +658,11 @@ func (b Billing) IsExhausted(minimum float64) bool {
 	}
 	return b.CreditUsagePercent >= 100 && (b.OnDemandCap > 0 || b.UsagePeriodType != "")
 }
+
+// SupportsWebVideoDuration routes six seconds to Free and longer videos to other tiers.
+func (c Credential) SupportsWebVideoDuration(seconds int) bool {
+	if c.WebTier == WebTierBasic {
+		return seconds == 6
+	}
+	return seconds > 6
+}

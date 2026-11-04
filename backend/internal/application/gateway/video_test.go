@@ -894,7 +894,7 @@ func TestVideoWebForbiddenRetriesPinnedAccountOnceThenFailsOver(t *testing.T) {
 		ID: "video_forbidden_retry", RequestID: "request-video-retry", ClientKeyID: key.ID, ClientKeyName: key.Name,
 		AccountID: first.ID, AccountName: first.Name, Provider: string(account.ProviderWeb),
 		Model: route.PublicID, ModelRouteID: route.ID, UpstreamModel: route.UpstreamModel,
-		Operation: provider.VideoOperationGenerate, Prompt: "test", Seconds: 5, Quality: "720p",
+		Operation: provider.VideoOperationGenerate, Prompt: "test", Seconds: 10, Quality: "720p",
 		Status: media.StatusInProgress, InputJSON: `{}`, CreatedAt: now, UpdatedAt: now,
 	}
 	if err := mediaRepo.CreateMediaJob(ctx, job); err != nil {

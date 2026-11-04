@@ -1897,7 +1897,7 @@ func TestGenerateVideoRefreshesOnlyReloadStatsigForbidden(t *testing.T) {
 
 			result, err := adapter.GenerateVideo(context.Background(), provider.VideoRequest{
 				Credential: account.Credential{ID: 1, Provider: account.ProviderWeb, EncryptedAccessToken: encryptedToken},
-				Prompt:     "test", Duration: 5,
+				Prompt:     "test", Duration: 10,
 			})
 			if test.wantSuccess {
 				if err != nil || result.URL != "https://assets.grok.com/videos/final.mp4" {
@@ -1970,7 +1970,7 @@ func TestGenerateVideoClassifiesOnlyExplicitHTTPRejectionAsCreateFailure(t *test
 	request := provider.VideoRequest{
 		Credential: account.Credential{ID: 1, Provider: account.ProviderWeb, EncryptedAccessToken: encryptedToken},
 		Prompt:     "test",
-		Duration:   5,
+		Duration:   10,
 	}
 
 	_, err = adapter.GenerateVideo(context.Background(), request)

@@ -558,7 +558,7 @@ func (s *Selector) acquire(ctx context.Context, provider account.Provider, model
 			continue
 		}
 		consideredCandidates++
-		if !s.candidateSupportsModel(provider, upstreamModel, quotaMode, candidate) {
+		if !candidateSupportsVideoDuration(ctx, provider, candidate.Credential) || !s.candidateSupportsModel(provider, upstreamModel, quotaMode, candidate) {
 			continue
 		}
 		supportedCandidates++
@@ -875,7 +875,7 @@ func (s *Selector) acquirePinned(ctx context.Context, provider account.Provider,
 			return nil, pinnedUnavailableError(accountID, value.Name)
 		}
 		if inference {
-			if !s.candidateSupportsModel(provider, upstreamModel, quotaMode, candidate) {
+			if !candidateSupportsVideoDuration(ctx, provider, candidate.Credential) || !s.candidateSupportsModel(provider, upstreamModel, quotaMode, candidate) {
 				return nil, &SelectionUnavailableError{Reason: SelectionUnsupportedModel}
 			}
 			if candidate.ModelQuotaBlock != nil && now.Before(candidate.ModelQuotaBlock.CooldownUntil) {

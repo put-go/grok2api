@@ -812,8 +812,83 @@ func TestSelectorAllowsBasicOnlyForConfirmedWebVideoQuota(t *testing.T) {
 		t.Fatalf("720p Basic video lease = %#v", lease)
 	}
 	lease.Release()
-	if _, err := selector.Acquire(ctx, account.ProviderWeb, 0, "grok-imagine-video", account.QuotaModeWebVideo, "", nil, false); err == nil {
-		t.Fatal("Basic account was selected for an unverified Web video quota product")
+	for _, seconds := range []int{4, 6, 10, 15} {
+		videoCtx := context.WithValue(ctx, videoDurationContextKey{}, seconds)
+		session, selectionErr := selector.beginSelectionSession(videoCtx, account.ProviderWeb, 0, "grok-imagine-video", account.QuotaModeWebVideo720p, "", nil, false)
+		if seconds == 6 {
+			if selectionErr != nil {
+				t.Fatal(selectionErr)
+			}
+			selected, err := session.Acquire(videoCtx, nil, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			selected.Release()
+		} else if selectionErr == nil {
+			t.Fatalf("Free selected for %d seconds", seconds)
+		}
+		pinned, pinnedErr := selector.AcquirePinned(videoCtx, account.ProviderWeb, basic.ID, 0, "grok-imagine-video", account.QuotaModeWebVideo720p, true)
+		if pinnedErr == nil {
+			pinned.Release()
+			if seconds != 6 {
+				t.Fatalf("Free pinned for %d seconds", seconds)
+			}
+		} else if seconds == 6 {
+			t.Fatal(pinnedErr)
+		}
+	}
+	paid, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderWeb, AuthType: account.AuthTypeSSO, WebTier: account.WebTierSuper,
+		Name: "paid-video", SourceKey: "paid-video", EncryptedAccessToken: "encrypted",
+		AuthStatus: account.AuthStatusActive, MaxConcurrent: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	selector = NewSelector(accounts, memory.NewConcurrencyLimiter(), memory.NewStickyStore(), webVideoTierOrder{}, time.Hour, time.Second, time.Minute)
+	for _, seconds := range []int{5, 6} {
+		shortCtx := context.WithValue(ctx, videoDurationContextKey{}, seconds)
+		if lease, err := selector.AcquirePinned(shortCtx, account.ProviderWeb, paid.ID, 0, "grok-imagine-video", account.QuotaModeWebVideo720p, true); err == nil {
+			lease.Release()
+			t.Fatalf("non-Free pinned for %d seconds", seconds)
+		}
+		shortSession, err := selector.beginSelectionSession(shortCtx, account.ProviderWeb, 0, "grok-imagine-video", account.QuotaModeWebVideo720p, "", nil, false)
+		if seconds < 6 {
+			if err == nil {
+				t.Fatal("short video selected an account")
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		lease, err := shortSession.Acquire(shortCtx, nil, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lease.Release()
+		if lease.Credential.ID != basic.ID {
+			t.Fatal("6s video selected non-Free account")
+		}
+	}
+	videoCtx := context.WithValue(ctx, videoDurationContextKey{}, 10)
+	session, err := selector.beginSelectionSession(videoCtx, account.ProviderWeb, 0, "grok-imagine-video", account.QuotaModeWebVideo720p, "", nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	selected, err := session.Acquire(videoCtx, nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selected.Credential.ID != paid.ID {
+		t.Fatalf("10s selected account %d, want paid %d", selected.Credential.ID, paid.ID)
+	}
+	selected.Release()
+	if lease, err := selector.Acquire(ctx, account.ProviderWeb, 0, "grok-imagine-video", account.QuotaModeWebVideo, "", nil, false); err == nil {
+		lease.Release()
+		if lease.Credential.ID == basic.ID {
+			t.Fatal("Basic account was selected for an unverified Web video quota product")
+		}
 	}
 }
 

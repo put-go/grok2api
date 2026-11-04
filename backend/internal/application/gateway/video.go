@@ -155,6 +155,7 @@ func (s *Service) CreateVideo(ctx context.Context, input VideoInput) (media.Job,
 	if err != nil {
 		return media.Job{}, err
 	}
+	ctx = context.WithValue(ctx, videoDurationContextKey{}, input.Duration)
 	route, selection, err := s.selectSchedulableEligibleMediaRouteWithQuotaMode(ctx, routes, input.ClientKey, true, func(route model.Route) string {
 		return videoQuotaMode(route.Provider, s.providers.QuotaMode(route.Provider, route.UpstreamModel), input.Resolution)
 	})
@@ -526,6 +527,7 @@ func (s *Service) runVideoJob(parent context.Context, job media.Job, route model
 		aspectRatio, resolution = "", ""
 	}
 
+	ctx = context.WithValue(ctx, videoDurationContextKey{}, duration)
 	quotaMode := videoQuotaMode(route.Provider, s.providers.QuotaMode(route.Provider, route.UpstreamModel), job.Quality)
 	quotaRefreshGroup := s.providers.QuotaRefreshGroup(route.Provider, route.UpstreamModel)
 	attemptPolicy := s.videoAttemptPolicy()
@@ -1426,4 +1428,12 @@ func (s *Service) persistVideoJobWithRetry(ctx context.Context, job media.Job) e
 		}
 	}
 	return lastErr
+}
+
+// Video duration is a request constraint, independent of the quota product.
+type videoDurationContextKey struct{}
+
+func candidateSupportsVideoDuration(ctx context.Context, providerValue account.Provider, credential account.Credential) bool {
+	seconds, videoRequest := ctx.Value(videoDurationContextKey{}).(int)
+	return !videoRequest || providerValue != account.ProviderWeb || credential.SupportsWebVideoDuration(seconds)
 }

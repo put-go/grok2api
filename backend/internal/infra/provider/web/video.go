@@ -302,6 +302,9 @@ func boundWebMediaDiagnostic(value string, limit int) string {
 }
 
 func (a *Adapter) GenerateVideo(ctx context.Context, request provider.VideoRequest) (provider.VideoResult, error) {
+	if !request.Credential.SupportsWebVideoDuration(request.Duration) {
+		return provider.VideoResult{}, provider.WrapVideoStage(provider.VideoStagePrepare, 0, fmt.Errorf("Free 账号仅支持 6 秒视频，非 Free 账号仅支持大于 6 秒的视频，当前请求为 %d 秒", request.Duration))
+	}
 	rawReferences := make([]string, 0, 1+len(request.ReferenceURLs))
 	referenceCount := len(request.ReferenceURLs)
 	if imageURL := strings.TrimSpace(request.ImageURL); imageURL != "" {
@@ -340,7 +343,7 @@ func (a *Adapter) GenerateVideo(ctx context.Context, request provider.VideoReque
 	if len(videoSegments(request.Duration)) == 0 {
 		return provider.VideoResult{}, provider.WrapVideoStage(provider.VideoStagePrepare, 0, fmt.Errorf("duration 必须在 1 到 15 秒之间"))
 	}
-	seconds := applyFreeWebVideoDurationCap(request.Duration, cfg.FreeVideoDurationCap, request.Credential)
+	seconds := request.Duration
 	segments := videoSegments(seconds)
 	ratio := resolveAspectRatio(request.AspectRatio)
 	resolution := request.Resolution
@@ -818,23 +821,6 @@ func videoCreateTextPayload(prompt, ratio, resolution string, seconds int) map[s
 
 func normalizeFreeVideoDurationCap(value int) int {
 	return settingsdomain.NormalizeWebFreeVideoDurationCap(value)
-}
-
-func shouldCapWebVideoDuration(credential account.Credential) bool {
-	return credential.WebTier == account.WebTierBasic
-}
-
-// applyFreeWebVideoDurationCap clamps duration for free-tier Web accounts so
-// upstream 429s from >6s (or the configured cap) do not trigger useless account rotation.
-func applyFreeWebVideoDurationCap(seconds, cap int, credential account.Credential) int {
-	if !shouldCapWebVideoDuration(credential) {
-		return seconds
-	}
-	cap = normalizeFreeVideoDurationCap(cap)
-	if seconds > cap {
-		return cap
-	}
-	return seconds
 }
 
 func videoModeMessage(prompt, mode string) string {
