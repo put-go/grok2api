@@ -67,24 +67,25 @@ type MediaConfig struct {
 }
 
 type ProviderWebConfig struct {
-	BaseURL              string
-	StatsigMode          string
-	StatsigManualValue   string
-	StatsigSignerURL     string
-	ClearanceMode        string
-	FlareSolverrURL      string
-	ClearanceTimeout     time.Duration
-	ClearanceRefresh     time.Duration
-	QuotaTimeout         time.Duration
-	ChatTimeout          time.Duration
-	StreamIdleTimeout    time.Duration
-	ImageTimeout         time.Duration
-	VideoTimeout         time.Duration
-	MediaConcurrency     int
-	AllowNSFW            bool
-	FreeVideoDurationCap int
-	RecoveryBackoffBase  time.Duration
-	RecoveryBackoffMax   time.Duration
+	BaseURL                 string
+	StatsigMode             string
+	StatsigManualValue      string
+	StatsigSignerURL        string
+	ClearanceMode           string
+	FlareSolverrURL         string
+	ClearanceTimeout        time.Duration
+	ClearanceRefresh        time.Duration
+	QuotaTimeout            time.Duration
+	ChatTimeout             time.Duration
+	StreamIdleTimeout       time.Duration
+	ImageTimeout            time.Duration
+	VideoTimeout            time.Duration
+	MediaConcurrency        int
+	AllowNSFW               bool
+	FreeVideoDurationCap    int
+	NonFreeVideoMinDuration int
+	RecoveryBackoffBase     time.Duration
+	RecoveryBackoffMax      time.Duration
 }
 
 // BatchConfig 定义账号导入、转换、同步和凭据刷新的并发上限。
@@ -162,4 +163,12 @@ type AccountsConfig struct {
 	AutoCleanReauthMinAge time.Duration
 	// AutoCleanIncludeDisabled 为 true 时，reauth 清理时包含 enabled=false 的账号。
 	AutoCleanIncludeDisabled bool
+}
+
+// NormalizeWebNonFreeVideoMinDuration preserves the existing >6s routing default.
+func NormalizeWebNonFreeVideoMinDuration(value int) int {
+	if value < 1 || value > 15 {
+		return 7
+	}
+	return value
 }

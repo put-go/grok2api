@@ -302,8 +302,8 @@ func boundWebMediaDiagnostic(value string, limit int) string {
 }
 
 func (a *Adapter) GenerateVideo(ctx context.Context, request provider.VideoRequest) (provider.VideoResult, error) {
-	if !request.Credential.SupportsWebVideoDuration(request.Duration) {
-		return provider.VideoResult{}, provider.WrapVideoStage(provider.VideoStagePrepare, 0, fmt.Errorf("Free 账号仅支持 6 秒视频，非 Free 账号仅支持大于 6 秒的视频，当前请求为 %d 秒", request.Duration))
+	if !a.SupportsVideoDuration(request.Credential, request.Duration) {
+		return provider.VideoResult{}, provider.WrapVideoStage(provider.VideoStagePrepare, 0, fmt.Errorf("视频时长不符合账号规则：Free 仅支持 6 秒，非 Free 最少 %d 秒，当前请求 %d 秒", settingsdomain.NormalizeWebNonFreeVideoMinDuration(a.config().NonFreeVideoMinDuration), request.Duration))
 	}
 	rawReferences := make([]string, 0, 1+len(request.ReferenceURLs))
 	referenceCount := len(request.ReferenceURLs)

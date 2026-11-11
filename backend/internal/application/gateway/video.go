@@ -1433,7 +1433,15 @@ func (s *Service) persistVideoJobWithRetry(ctx context.Context, job media.Job) e
 // Video duration is a request constraint, independent of the quota product.
 type videoDurationContextKey struct{}
 
-func candidateSupportsVideoDuration(ctx context.Context, providerValue account.Provider, credential account.Credential) bool {
+func (s *Selector) candidateSupportsVideoDuration(ctx context.Context, providerValue account.Provider, credential account.Credential) bool {
 	seconds, videoRequest := ctx.Value(videoDurationContextKey{}).(int)
-	return !videoRequest || providerValue != account.ProviderWeb || credential.SupportsWebVideoDuration(seconds)
+	if !videoRequest || providerValue != account.ProviderWeb {
+		return true
+	}
+	if policy, ok := s.tierGroups.(interface {
+		SupportsVideoDuration(account.Provider, account.Credential, int) bool
+	}); ok {
+		return policy.SupportsVideoDuration(providerValue, credential, seconds)
+	}
+	return credential.SupportsWebVideoDuration(seconds)
 }

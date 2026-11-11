@@ -182,6 +182,7 @@ type WebProviderConfig struct {
 	MediaConcurrency         int      `yaml:"mediaConcurrency"`
 	AllowNSFW                bool     `yaml:"allowNSFW"`
 	FreeVideoDurationCap     int      `yaml:"freeVideoDurationCap"`
+	NonFreeVideoMinDuration  int      `yaml:"nonFreeVideoMinDuration"`
 	RecoveryBackoffBase      Duration `yaml:"recoveryBackoffBase"`
 	RecoveryBackoffMax       Duration `yaml:"recoveryBackoffMax"`
 }
@@ -664,6 +665,9 @@ func (c Config) Validate() error {
 	if c.Provider.Web.MediaConcurrency < 1 || c.Provider.Web.MediaConcurrency > 64 {
 		return errors.New("provider.web 媒体并发必须在 1 到 64 之间")
 	}
+	if c.Provider.Web.NonFreeVideoMinDuration < 0 || c.Provider.Web.NonFreeVideoMinDuration > 15 {
+		return errors.New("provider.web.nonFreeVideoMinDuration 必须在 1 到 15 秒之间")
+	}
 	if c.Provider.Web.FreeVideoDurationCap != 0 && (c.Provider.Web.FreeVideoDurationCap < settingsdomain.MinWebFreeVideoDurationCap || c.Provider.Web.FreeVideoDurationCap > settingsdomain.MaxWebFreeVideoDurationCap) {
 		return errors.New("provider.web free 视频时长上限必须在 1 到 15 秒之间")
 	}
@@ -924,9 +928,10 @@ func defaultConfig() Config {
 				ClearanceTimeout: Duration(time.Minute), ClearanceRefresh: Duration(10 * time.Minute),
 				QuotaTimeout: Duration(25 * time.Second),
 				ChatTimeout:  Duration(2 * time.Minute), StreamIdleTimeout: Duration(settingsdomain.DefaultWebStreamIdleTimeout),
-				ImageTimeout:     Duration(3 * time.Minute),
-				VideoTimeout:     Duration(15 * time.Minute),
-				MediaConcurrency: 4, FreeVideoDurationCap: settingsdomain.DefaultWebFreeVideoDurationCap, RecoveryBackoffBase: Duration(30 * time.Second),
+				ImageTimeout:            Duration(3 * time.Minute),
+				VideoTimeout:            Duration(15 * time.Minute),
+				NonFreeVideoMinDuration: 7,
+				MediaConcurrency:        4, FreeVideoDurationCap: settingsdomain.DefaultWebFreeVideoDurationCap, RecoveryBackoffBase: Duration(30 * time.Second),
 				RecoveryBackoffMax: Duration(30 * time.Minute),
 			},
 			Console: ConsoleProviderConfig{BaseURL: "https://console.x.ai", ChatTimeout: Duration(5 * time.Minute), StreamIdleTimeout: Duration(settingsdomain.DefaultConsoleStreamIdleTimeout)},

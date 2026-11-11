@@ -206,3 +206,29 @@ func TestLegacySettingsRequestMayOmitManagedClearance(t *testing.T) {
 		t.Fatal("missing managed-clearance fields were treated as an explicit update")
 	}
 }
+
+func TestNonFreeVideoMinDurationPresenceIsPreserved(t *testing.T) {
+	response := newSettingsResponse(settingsapp.Snapshot{Config: settingsapp.EditableConfig{
+		ProviderWeb: settingsapp.ProviderWebConfig{NonFreeVideoMinDuration: 8},
+	}})
+	if response.Config.ProviderWeb.NonFreeVideoMinDuration == nil || *response.Config.ProviderWeb.NonFreeVideoMinDuration != 8 {
+		t.Fatal("nonFreeVideoMinDuration was lost from settings response")
+	}
+
+	var legacy settingsConfigDTO
+	if err := json.Unmarshal([]byte(`{"providerWeb":{"baseURL":"https://grok.com"}}`), &legacy); err != nil {
+		t.Fatal(err)
+	}
+	if legacy.toApplication().ProviderWeb.NonFreeVideoMinDurationProvided {
+		t.Fatal("missing nonFreeVideoMinDuration was treated as an explicit update")
+	}
+
+	var explicit settingsConfigDTO
+	if err := json.Unmarshal([]byte(`{"providerWeb":{"nonFreeVideoMinDuration":8}}`), &explicit); err != nil {
+		t.Fatal(err)
+	}
+	input := explicit.toApplication()
+	if !input.ProviderWeb.NonFreeVideoMinDurationProvided || input.ProviderWeb.NonFreeVideoMinDuration != 8 {
+		t.Fatalf("explicit nonFreeVideoMinDuration was lost: %#v", input.ProviderWeb)
+	}
+}

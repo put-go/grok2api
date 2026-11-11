@@ -27,6 +27,7 @@ type Config struct {
 	MaxInputImageBytes       int64
 	AllowNSFW                bool
 	FreeVideoDurationCap     int
+	NonFreeVideoMinDuration  int
 }
 
 type Adapter struct {
@@ -206,4 +207,11 @@ func (a *Adapter) ListModels(_ context.Context, credential account.Credential) (
 		}
 	}
 	return values, nil
+}
+
+func (a *Adapter) SupportsVideoDuration(credential account.Credential, seconds int) bool {
+	if credential.WebTier == account.WebTierBasic {
+		return seconds == 6
+	}
+	return seconds >= settingsdomain.NormalizeWebNonFreeVideoMinDuration(a.config().NonFreeVideoMinDuration)
 }

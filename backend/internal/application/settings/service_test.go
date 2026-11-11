@@ -938,3 +938,64 @@ func TestUpdateRejectsInvalidBuildForbiddenCodes(t *testing.T) {
 		}
 	}
 }
+
+func TestUpdatePreservesNonFreeVideoMinDurationWhenFieldIsOmitted(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.Provider.Web.NonFreeVideoMinDuration = 8
+	repository := &runtimeSettingsRepositoryStub{}
+	var applied config.Config
+	service := NewService(cfg, time.Time{}, 0, repository, nil, func(next config.Config) { applied = next })
+	input := service.Get().Config
+	input.ProviderWeb.NonFreeVideoMinDuration = 0
+	input.ProviderWeb.NonFreeVideoMinDurationProvided = false
+
+	snapshot, err := service.Update(context.Background(), 0, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if applied.Provider.Web.NonFreeVideoMinDuration != 8 || repository.value.ProviderWeb.NonFreeVideoMinDuration != 8 {
+		t.Fatalf("omitted non-Free minimum duration was overwritten: applied=%d persisted=%d", applied.Provider.Web.NonFreeVideoMinDuration, repository.value.ProviderWeb.NonFreeVideoMinDuration)
+	}
+
+	input = snapshot.Config
+	input.ProviderWeb.NonFreeVideoMinDuration = 6
+	input.ProviderWeb.NonFreeVideoMinDurationProvided = true
+	if _, err := service.Update(context.Background(), snapshot.Revision, input); err != nil {
+		t.Fatal(err)
+	}
+	if applied.Provider.Web.NonFreeVideoMinDuration != 6 || repository.value.ProviderWeb.NonFreeVideoMinDuration != 6 {
+		t.Fatalf("configured non-Free minimum duration = %d, want %d", applied.Provider.Web.NonFreeVideoMinDuration, 6)
+	}
+}
+
+func TestLoadPersistedKeepsNonFreeVideoMinDurationForOlderPayload(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.Provider.Web.NonFreeVideoMinDuration = 8
+	persisted := toDomainConfig(cfg)
+	persisted.ProviderWeb.NonFreeVideoMinDuration = 0
+	repository := &runtimeSettingsRepositoryStub{value: persisted, found: true}
+
+	loaded, _, _, err := LoadPersisted(context.Background(), cfg, repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Provider.Web.NonFreeVideoMinDuration != 8 {
+		t.Fatalf("legacy persisted non-Free minimum duration = %d, want config value 8", loaded.Provider.Web.NonFreeVideoMinDuration)
+	}
+}
+
+func TestNonFreeVideoMinDurationRejectsInvalidSettings(t *testing.T) {
+	for _, value := range []int{-1, 0, 16} {
+		repository := &runtimeSettingsRepositoryStub{}
+		service := NewService(testConfig(t), time.Time{}, 0, repository, nil, nil)
+		input := service.Get().Config
+		input.ProviderWeb.NonFreeVideoMinDuration = value
+		input.ProviderWeb.NonFreeVideoMinDurationProvided = true
+		if _, err := service.Update(context.Background(), 0, input); !errors.Is(err, ErrInvalidInput) {
+			t.Fatalf("value=%d err=%v", value, err)
+		}
+		if repository.found {
+			t.Fatal("invalid value persisted")
+		}
+	}
+}

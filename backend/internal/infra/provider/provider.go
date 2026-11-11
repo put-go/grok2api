@@ -1498,3 +1498,16 @@ func FirstNonEmptyFailure(values ...string) string {
 	}
 	return ""
 }
+
+// SupportsVideoDuration reads the provider's current routing policy.
+func (r *Registry) SupportsVideoDuration(value account.Provider, credential account.Credential, seconds int) bool {
+	adapter, ok := r.Get(value)
+	if ok {
+		if policy, ok := adapter.(interface {
+			SupportsVideoDuration(account.Credential, int) bool
+		}); ok {
+			return policy.SupportsVideoDuration(credential, seconds)
+		}
+	}
+	return value != account.ProviderWeb || credential.SupportsWebVideoDuration(seconds)
+}

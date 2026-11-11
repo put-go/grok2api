@@ -76,7 +76,7 @@ func (s *Selector) beginSelectionSessionForKey(ctx context.Context, provider acc
 			continue
 		}
 		consideredCandidates++
-		if !candidateSupportsVideoDuration(ctx, provider, candidate.Credential) || !s.candidateSupportsModel(provider, upstreamModel, quotaMode, candidate) {
+		if !s.candidateSupportsVideoDuration(ctx, provider, candidate.Credential) || !s.candidateSupportsModel(provider, upstreamModel, quotaMode, candidate) {
 			continue
 		}
 		supportedCandidates++

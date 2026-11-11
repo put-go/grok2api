@@ -90,6 +90,7 @@ export const settingsSchema = z.object({
     quotaTimeout: durationSchema, chatTimeout: durationSchema, streamIdleTimeout: providerStreamIdleDuration, imageTimeout: durationSchema, videoTimeout: durationSchema,
     mediaConcurrency: positiveInteger.max(64), allowNSFW: z.boolean(),
     freeVideoDurationCap: z.number().int().min(1).max(15),
+    nonFreeVideoMinDuration: z.number().int().min(1).max(15),
     recoveryBackoffBase: durationSchema, recoveryBackoffMax: durationSchema,
   }).superRefine((value, context) => {
     if (durationSeconds(value.streamIdleTimeout) > durationSeconds(value.chatTimeout)) {
@@ -197,6 +198,7 @@ export function toSettingsForm(config: SettingsConfigDTO): SettingsForm {
       quotaTimeout: parseDuration(config.providerWeb.quotaTimeout), chatTimeout: parseDuration(config.providerWeb.chatTimeout), streamIdleTimeout: parseDuration(config.providerWeb.streamIdleTimeout),
       imageTimeout: parseDuration(config.providerWeb.imageTimeout), videoTimeout: parseDuration(config.providerWeb.videoTimeout),
       freeVideoDurationCap: config.providerWeb.freeVideoDurationCap || 6,
+      nonFreeVideoMinDuration: config.providerWeb.nonFreeVideoMinDuration || 7,
       recoveryBackoffBase: parseDuration(config.providerWeb.recoveryBackoffBase), recoveryBackoffMax: parseDuration(config.providerWeb.recoveryBackoffMax),
     },
     providerConsole: { ...config.providerConsole, chatTimeout: parseDuration(config.providerConsole.chatTimeout), streamIdleTimeout: parseDuration(config.providerConsole.streamIdleTimeout) },
