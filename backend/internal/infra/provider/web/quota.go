@@ -21,6 +21,19 @@ import (
 const weeklyQuotaMode = "weekly"
 
 func (a *Adapter) SyncQuota(ctx context.Context, credential account.Credential) (provider.QuotaSnapshot, error) {
+	// Explicit current subscription entitlements take precedence over legacy
+	// chat-counter heuristics, including canceled-but-unexpired subscriptions.
+	tier, subscriptionErr := a.syncSubscriptionTier(ctx, credential)
+	if errors.Is(subscriptionErr, provider.ErrUnauthorized) {
+		return provider.QuotaSnapshot{}, subscriptionErr
+	}
+	if subscriptionErr == nil && tier == account.WebTierSuper {
+		weekly, err := a.syncWeeklyCredits(ctx, credential)
+		if err != nil {
+			return provider.QuotaSnapshot{}, err
+		}
+		return provider.QuotaSnapshot{Tier: tier, Windows: []account.QuotaWindow{weekly}, SyncedAt: time.Now().UTC()}, nil
+	}
 	chatWindows := make([]account.QuotaWindow, 0, 2)
 	autoWindow, autoErr := a.SyncQuotaMode(ctx, credential, "auto")
 	if errors.Is(autoErr, provider.ErrUnauthorized) {
@@ -405,23 +418,31 @@ func (a *Adapter) SyncQuotaMode(ctx context.Context, credential account.Credenti
 }
 
 func (a *Adapter) syncWeeklyCredits(ctx context.Context, credential account.Credential) (account.QuotaWindow, error) {
-	cfg := a.config()
-	token, err := a.cipher.Decrypt(credential.EncryptedAccessToken)
+	body, err := a.fetchBillingMessage(ctx, credential, "/grok_api_v2.GrokBuildBilling/GetGrokCreditsConfig")
 	if err != nil {
 		return account.QuotaWindow{}, err
 	}
+	return parseWeeklyCreditsResponse(body, credential.ID, time.Now().UTC())
+}
+
+func (a *Adapter) fetchBillingMessage(ctx context.Context, credential account.Credential, path string) ([]byte, error) {
+	cfg := a.config()
+	token, err := a.cipher.Decrypt(credential.EncryptedAccessToken)
+	if err != nil {
+		return nil, err
+	}
 	lease, err := a.egress.AcquireCredential(ctx, domainegress.ScopeWeb, credential)
 	if err != nil {
-		return account.QuotaWindow{}, err
+		return nil, err
 	}
 	defer lease.Release()
 
 	requestCtx, cancel := context.WithTimeout(ctx, time.Duration(cfg.QuotaTimeoutSeconds)*time.Second)
 	defer cancel()
-	endpoint := cfg.BaseURL + "/grok_api_v2.GrokBuildBilling/GetGrokCreditsConfig"
+	endpoint := cfg.BaseURL + path
 	request, err := http.NewRequestWithContext(requestCtx, http.MethodPost, endpoint, bytes.NewReader([]byte{0, 0, 0, 0, 0}))
 	if err != nil {
-		return account.QuotaWindow{}, err
+		return nil, err
 	}
 	request.Header = buildHeaders(token, lease, "application/grpc-web+proto")
 	applyAppHeaders(request.Header, cfg.BaseURL, cfg.BaseURL+"/")
@@ -432,32 +453,28 @@ func (a *Adapter) syncWeeklyCredits(ctx context.Context, credential account.Cred
 	response, err := lease.DoDeferredForbidden(request)
 	if err != nil {
 		a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, 0, err)
-		return account.QuotaWindow{}, err
+		return nil, err
 	}
 	defer response.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(response.Body, 4<<20))
 	if err != nil {
-		return account.QuotaWindow{}, err
+		return nil, err
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		if response.StatusCode == http.StatusUnauthorized {
-			return account.QuotaWindow{}, provider.ErrUnauthorized
+			return nil, provider.ErrUnauthorized
 		}
 		if response.StatusCode == http.StatusForbidden && provider.IsDefinitiveAccountBlockBody(body) {
-			return account.QuotaWindow{}, fmt.Errorf("%w: account blocked", provider.ErrUnauthorized)
+			return nil, fmt.Errorf("%w: account blocked", provider.ErrUnauthorized)
 		}
 		if response.StatusCode == http.StatusForbidden {
 			lease.InvalidateClearance()
 		}
 		a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, response.StatusCode, nil)
-		return account.QuotaWindow{}, fmt.Errorf("Grok Web 周额度接口返回 %d", response.StatusCode)
-	}
-	window, err := parseWeeklyCreditsResponse(body, credential.ID, time.Now().UTC())
-	if err != nil {
-		return account.QuotaWindow{}, err
+		return nil, fmt.Errorf("Grok Web Billing 接口返回 %d", response.StatusCode)
 	}
 	a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, response.StatusCode, nil)
-	return window, nil
+	return body, nil
 }
 
 func parseWeeklyCreditsResponse(body []byte, accountID uint64, syncedAt time.Time) (account.QuotaWindow, error) {
@@ -578,7 +595,7 @@ func parseGRPCWebFrames(body []byte) ([]byte, string, error) {
 				return nil, "", fmt.Errorf("不支持压缩的 gRPC-Web 响应")
 			}
 			if message == nil {
-				message = append([]byte(nil), payload...)
+				message = append([]byte{}, payload...)
 			}
 			continue
 		}
